@@ -10,6 +10,7 @@ import json
 import os
 import urllib.request
 
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -33,9 +34,30 @@ CACHE_SYMBOL_DIR: Path = CACHE_ROOT / "SYMBOL_DATA"
 _VERSION_CHECKED: bool = False
 # The manifest, parsed once per process.
 _MANIFEST: dict | None = None
+# The browser's download function, set once at startup. The desktop never sets it,
+# so the CLI always uses the urllib default below.
+_FETCH: Callable | None = None
 
 
 # -------- Fetching --------
+# Use this download function for every later sync instead of urllib. The browser
+# passes its JS fetch bridge here once at startup; the desktop never calls this.
+def set_fetch(fetch: Callable) -> None:
+    global _FETCH
+    _FETCH = fetch
+
+
+# Forget the override and go back to urllib.
+def reset_fetch() -> None:
+    global _FETCH
+    _FETCH = None
+
+
+# The explicit hook first, then the browser override, then the urllib default.
+def _resolve_fetch(fetch: Callable | None) -> Callable:
+    return fetch or _FETCH or _default_fetch
+
+
 # Download one URL straight to a file: single GET, atomic rename, resumable
 # nowhere because a killed download restarts from zero on the next call.
 def _default_fetch(url: str, dest: Path) -> None:
@@ -53,7 +75,8 @@ def _default_fetch(url: str, dest: Path) -> None:
 
 # One small GET returning decoded text, through the same hook as everything else.
 def _get_text(key: str, fetch=None) -> str:
-    if fetch is None:
+    fetch = _resolve_fetch(fetch)
+    if fetch is _default_fetch:
         request = urllib.request.Request(f"{REMOTE_BASE_URL}/{key}", headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request) as response:
             return response.read().decode("utf-8")
@@ -107,7 +130,7 @@ def ensure_local(key: str, cache_root: Path = CACHE_ROOT, fetch=None, size: int 
     dest = cache_root / key
     if dest.is_file() and (size is None or dest.stat().st_size == size):
         return dest
-    (fetch or _default_fetch)(f"{REMOTE_BASE_URL}/{key}", dest)
+    _resolve_fetch(fetch)(f"{REMOTE_BASE_URL}/{key}", dest)
     return dest
 
 
