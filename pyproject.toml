@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sltp"
+version = "0.1.22"
+description = "A pure-NumPy daily-bar backtesting engine: point-in-time strategy views, portfolio accounting, metrics, SVG charts and a CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "ItsMacc" }]
+keywords = [
+    "backtesting",
+    "trading",
+    "quant",
+    "finance",
+    "stocks",
+    "indicators",
+    "equity-curve",
+    "numpy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+# Ranges track what Pyodide 314.x ships, so the same pins resolve in a browser
+# through micropip: numpy 2.4.6, pyarrow 22.0.0, pandas 3.0.2. An upper bound is
+# deliberate: micropip cannot build a source distribution, so a version outside
+# the wheel it has fails the install outright.
+dependencies = [
+    "numpy>=2.4,<2.5",
+    "pyarrow>=22,<23",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+# Only needed to rebuild the symbol catalog, never to run a backtest.
+data = [
+    "pandas>=3.0,<3.1",
+    "requests>=2.31",
+]
+dev = [
+    "pytest>=7",
+    "build>=1.2",
+    "twine>=5",
+]
+
+[project.urls]
+Homepage = "https://github.com/ItsMacc/SLTP"
+Repository = "https://github.com/ItsMacc/SLTP"
+Issues = "https://github.com/ItsMacc/SLTP/issues"
+
+[project.scripts]
+sltp = "sltp.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# The src layout already keeps scripts/ and test/ out of the wheel; naming the
+# package explicitly stops a stray directory from being swept in later.
+include = ["sltp*"]
+
+# Bars are data, not source. Nothing shipped in sltp/ reads a non-.py file, so
+# these are belt-and-braces should one be dropped next to the code by mistake.
+[tool.setuptools.exclude-package-data]
+"*" = ["*.parquet", "*.json", "*.gz", "*.tar"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

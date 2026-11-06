@@ -1,0 +1,1 @@
+{"datasets": {"market_actions": {"columns": {"Amount": "split ratio (Kind 0; e.g. 7.0 is 7-for-1, 0.1 is 1-for-10 reverse) or cash per share in dollars (Kind 1)", "Date": "int32 days since 1970-01-01", "Kind": "0 = split, 1 = dividend", "Symbol": "ticker, e.g. AAPL"}}}, "date_encoding": "int32 days since 1970-01-01 (e.g. 20760 = 2026-11-03)"}
