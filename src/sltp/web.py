@@ -73,7 +73,7 @@ def to_jsonable(result: dict) -> dict:
         for point in result.get("equity") or []
     ]
     trades = [_trade_to_dict(trade) for trade in result.get("trades") or []]
-    return {"stats": stats, "equity": equity, "trades": trades}
+    return {"stats": stats, "equity": equity, "trades": trades, "stamp": result.get("stamp") or {}}
 
 
 # -------- Chart --------

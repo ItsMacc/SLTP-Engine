@@ -44,8 +44,9 @@ DEFAULT_START: str = "1998-01-01"
 DATE_FORMAT: str = "%Y-%m-%d"
 PRICE_COLS: list[str] = ["Open", "High", "Low", "Close", "Volume"]
 BAR_COLS: list[str] = ["Symbol", "Date", *PRICE_COLS]
-BATCH_ROWS: int = 1_000_000
 SYMBOL_CACHE_LIMIT: int = 500
+# Largest selective read: bigger requests go in batches of this size, so a full
+# universe never holds every ticker in memory at once.
 BULK_READ_THRESHOLD: int = 500
 
 Scope = Literal["all", "stocks", "missing"]
@@ -57,11 +58,8 @@ TRADABLE_STATUSES: tuple[str, ...] = ("active", "lagging")
 MIN_TRADABLE_BARS: int = 30
 
 _CACHE: dict[str, tuple[tuple | None, object]] = {}  # key -> (file signature, value)
-_HISTORY_CACHE: dict[str, StockData] = {}  # every ticker's bars, loaded in one pass
-_HISTORY_SIGNATURE: tuple | None = None
-_SYMBOL_CACHE: OrderedDict[str, StockData] = OrderedDict()  # bounded cache for small reads
+_SYMBOL_CACHE: OrderedDict[str, StockData] = OrderedDict()  # bounded cache for selective reads
 _SYMBOL_CACHE_SIGNATURE: tuple | None = None
-_SESSIONS: np.ndarray | None = None  # every session in the bar files, once a full read has seen them
 _LOAD_LOCK = threading.RLock()  # without it, concurrent cold requests each load the file
 
 
@@ -210,10 +208,13 @@ def get_stock_histories(tickers: list[str], start: str | None = None, end: str |
     start = start or DEFAULT_START
     _validate_range(start, end)
     symbols: list[str] = [ticker.strip().upper() for ticker in tickers]
-    histories: dict[str, StockData] = (
-        _selected_histories(symbols, start, end) if len(set(symbols)) <= BULK_READ_THRESHOLD
-        else _all_histories(symbols, start, end)
-    )
+
+    # Big universes go in bounded batches of selected reads. One full scan would hold
+    # every ticker (~240MB peak); one batch holds a few hundred symbols at most.
+    histories: dict[str, StockData] = {}
+    unique: list[str] = list(dict.fromkeys(symbols))
+    for offset in range(0, len(unique), BULK_READ_THRESHOLD):
+        histories.update(_selected_histories(unique[offset:offset + BULK_READ_THRESHOLD], start, end))
 
     result: dict[str, StockData] = {}
     for symbol in symbols:
@@ -244,14 +245,11 @@ def get_splits(ticker: str, start: str | None = None, end: str | None = None) ->
 
 # Drop every cached value so the next read reloads from disk.
 def refresh_market_data_cache() -> None:
-    global _HISTORY_SIGNATURE, _SYMBOL_CACHE_SIGNATURE, _SESSIONS
+    global _SYMBOL_CACHE_SIGNATURE
     with _LOAD_LOCK:
         _CACHE.clear()
-        _HISTORY_CACHE.clear()
         _SYMBOL_CACHE.clear()
-        _HISTORY_SIGNATURE = None
         _SYMBOL_CACHE_SIGNATURE = None
-        _SESSIONS = None
 
 
 # -------- Catalog --------
@@ -419,22 +417,7 @@ def _tickers_in_categories(kinds: tuple[str, ...]) -> list[str]:
 
 
 # -------- History Helpers --------
-# Histories for a large request: load the files once, then serve from memory.
-def _all_histories(symbols: list[str], start: str | None = None, end: str | None = None) -> dict[str, StockData]:
-    global _HISTORY_SIGNATURE
-    files: list[str] = bar_files_for(start, end)
-    with _LOAD_LOCK:
-        signature: tuple = _files_signature(files)
-        if signature != _HISTORY_SIGNATURE:
-            _HISTORY_CACHE.clear()
-            _SYMBOL_CACHE.clear()
-            _HISTORY_CACHE.update(_read_all_histories(files))
-            _HISTORY_SIGNATURE = signature
-
-        return {symbol: _HISTORY_CACHE[symbol] for symbol in symbols if symbol in _HISTORY_CACHE}
-
-
-# Histories for a small request, reading only those symbols' row groups.
+# Histories for a request, reading only those symbols' row groups.
 def _selected_histories(symbols: list[str], start: str | None = None, end: str | None = None) -> dict[str, StockData]:
     global _SYMBOL_CACHE_SIGNATURE
     wanted: list[str] = list(dict.fromkeys(symbols))
@@ -444,10 +427,6 @@ def _selected_histories(symbols: list[str], start: str | None = None, end: str |
         if signature != _SYMBOL_CACHE_SIGNATURE:
             _SYMBOL_CACHE.clear()
             _SYMBOL_CACHE_SIGNATURE = signature
-
-        # A loaded universe already holds every bar, so never keep a second copy of it.
-        if _HISTORY_CACHE and signature == _HISTORY_SIGNATURE:
-            return {symbol: _HISTORY_CACHE[symbol] for symbol in wanted if symbol in _HISTORY_CACHE}
 
         missing: list[str] = [symbol for symbol in wanted if symbol not in _SYMBOL_CACHE]
         if missing:
@@ -592,23 +571,9 @@ def _codes_from_table(table: pa.Table) -> np.ndarray:
 
 # Every trading day in the given files, as sorted int32 codes.
 def _read_trading_calendar(files: list[str] | None = None) -> np.ndarray:
-    sessions: np.ndarray | None = _known_sessions() if files is None else None
-    codes: np.ndarray = sessions if sessions is not None else np.unique(_codes_from_table(_read_table(["Date"], files=files)))
+    codes: np.ndarray = np.unique(_codes_from_table(_read_table(["Date"], files=files)))
     CALENDAR.register(labels_from_codes(codes))
     return codes
-
-
-# Sessions collected while the whole universe was read, or None if it has not been read.
-def _known_sessions() -> np.ndarray | None:
-    if _SESSIONS is not None and _HISTORY_CACHE and _HISTORY_SIGNATURE == _bars_signature():
-        return _SESSIONS
-    return None
-
-
-# The given files as StockData per symbol; only a read of every file keeps the sessions.
-def _read_all_histories(files: list[str] | None = None) -> dict[str, StockData]:
-    paths: list[str] = files if files is not None else bar_files()
-    return _build_histories(_iter_bar_batches(paths), _count_rows(paths), complete=paths == bar_files())
 
 
 # Only the requested symbols, letting row-group statistics skip the rest.
@@ -616,18 +581,6 @@ def _read_requested_histories(symbols: list[str], files: list[str] | None = None
     filters = [("Symbol", "=", symbols[0])] if len(symbols) == 1 else [("Symbol", "in", symbols)]
     table: pa.Table = _read_table(BAR_COLS, filters, files)
     return _build_histories(table.to_batches(), table.num_rows)
-
-
-# Stream the bars of every file, one row group at a time.
-def _iter_bar_batches(paths: list[str]):
-    for path in paths:
-        for batch in pq.ParquetFile(path).iter_batches(batch_size=BATCH_ROWS, columns=BAR_COLS):
-            yield batch
-
-
-# Total bars across the given files.
-def _count_rows(paths: list[str]) -> int:
-    return sum(pq.ParquetFile(path).metadata.num_rows for path in paths)
 
 
 # Every event of one kind grouped by symbol, so a dividend lookup is a dict hit, not a parquet read.
@@ -669,9 +622,7 @@ def _events_in_range(codes: np.ndarray, amounts: np.ndarray, start: str | None, 
 
 
 # Streamed bars into one StockData per symbol; arrays are slices of shared blocks.
-# A complete read also keeps the sessions, so the calendar never reads Date again.
-def _build_histories(batches, rows: int, complete: bool = False) -> dict[str, StockData]:
-    global _SESSIONS
+def _build_histories(batches, rows: int) -> dict[str, StockData]:
     if rows == 0:
         return {}
 
@@ -680,7 +631,6 @@ def _build_histories(batches, rows: int, complete: bool = False) -> dict[str, St
     volume: np.ndarray = np.empty(rows, dtype=np.float32)
     symbols: np.ndarray = np.empty(rows, dtype=np.int32)
     ids: dict[str, int] = {}
-    sessions: list[np.ndarray] = []
     at: int = 0
 
     for batch in batches:
@@ -690,15 +640,11 @@ def _build_histories(batches, rows: int, complete: bool = False) -> dict[str, St
         symbols[at:at + count] = local[encoded.indices.to_numpy()]
         dates = batch.column("Date").to_numpy()
         date[at:at + count] = dates
-        sessions.append(np.unique(dates))
-        CALENDAR.register(labels_from_codes(sessions[-1]))
+        CALENDAR.register(labels_from_codes(np.unique(dates)))
         for name, target in prices.items():
             target[at:at + count] = batch.column(name).to_numpy()
         volume[at:at + count] = batch.column("Volume").to_numpy()
         at += count
-
-    if complete and sessions:
-        _SESSIONS = np.unique(np.concatenate(sessions))
 
     names: list[str] = [""] * len(ids)
     for label, index in ids.items():

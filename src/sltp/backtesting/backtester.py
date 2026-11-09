@@ -29,6 +29,71 @@ MAX_WARMUP_DAYS: int = 1826
 MAX_DIVIDEND_YIELD: float = 1.0
 
 
+# -------- Stamp --------
+# What a run is made of, so results can be cached honestly and compared fairly:
+# package and data versions, the requested and actual range, the cost knobs and
+# the strategy's own knobs. Everything in it survives json.dumps.
+_MISSING = object()
+
+
+# The installed package version, or "unknown" when it cannot be determined.
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version as _dist_version
+        return _dist_version("sltp")
+    except Exception:
+        return "unknown"
+
+
+# The published data version, or "unknown" when the manifest was never read.
+# Sync paths already parse it, so this costs nothing whenever data was fetched.
+def _data_version() -> str:
+    try:
+        from sltp.data.remote import read_manifest
+        return str(read_manifest().get("version", "unknown"))
+    except Exception:
+        return "unknown"
+
+
+# A value that survives json.dumps, or _MISSING when it cannot be represented.
+# Plain scalars pass through; enums unwrap to their value; lists stay lists.
+def _stamp_scalar(value):
+    value = getattr(value, "value", value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        item is None or isinstance(item, (bool, int, float, str)) for item in value
+    ):
+        return list(value)
+    return _MISSING
+
+
+# The strategy's knobs: its constraints plus any public scalar the subclass set.
+# The universe itself stays out: it is rebuilt from code and data at run time.
+def _strategy_params(strategy) -> dict:
+    base: set[str] = set(vars(Strategy()))
+    custom: dict = {}
+    for key, value in vars(strategy).items():
+        if key in base or key.startswith("_"):
+            continue
+        scalar = _stamp_scalar(value)
+        if scalar is not _MISSING:
+            custom[key] = scalar
+    return {
+        "class": type(strategy).__name__,
+        "name": getattr(strategy, "name", None),
+        "constraints": {
+            "max_positions": _stamp_scalar(getattr(strategy, "MAX_POSITIONS", None)),
+            "max_allocation_per_ticker": _stamp_scalar(getattr(strategy, "MAX_ALLOCATION_PER_TICKER", None)),
+            "max_lots_per_ticker": _stamp_scalar(getattr(strategy, "MAX_LOTS_PER_TICKER", None)),
+            "rebalance_frequency": _stamp_scalar(getattr(strategy, "REBALANCE_FREQUENCY", None)),
+            "min_bars_required": _stamp_scalar(getattr(strategy, "MIN_BARS_REQUIRED", None)),
+            "liquidate_on_end": _stamp_scalar(getattr(strategy, "LIQUIDATE_ON_END", None)),
+        },
+        "custom": custom,
+    }
+
+
 # -------- Backtester --------
 # One simulation: a strategy, a date range, and the bars it needs.
 class Backtester:
@@ -58,7 +123,7 @@ class Backtester:
         self._day_code = np.int32(0)
 
     # -------- Run --------
-    # Simulate the strategy and return metrics, equity, trades and rejections.
+    # Simulate the strategy and return metrics, equity, trades, rejections and a stamp.
     def run(self) -> dict:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
@@ -145,6 +210,23 @@ class Backtester:
             "equity": equity,
             "trades": self.manager.trades,
             "rejections": dict(sorted(self.manager.rejected_orders.items())),
+            "stamp": self._stamp(),
+        }
+
+    # What this run is made of: versions, range, costs and strategy knobs.
+    def _stamp(self) -> dict:
+        return {
+            "sltp_version": _package_version(),
+            "data_version": _data_version(),
+            "start": self.start_date,
+            "end": self.end_date,
+            "actual_start": self._equity_records[0]["date"] if self._equity_records else None,
+            "costs": {
+                "fee_rate": self.manager.FEE_RATE,
+                "slippage_pct": self.manager.SLIPPAGE_PCT,
+                "include_dividends": self.include_dividends,
+            },
+            "strategy": _strategy_params(self.strategy),
         }
 
     # -------- Metrics --------
