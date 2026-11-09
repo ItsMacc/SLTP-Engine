@@ -98,9 +98,21 @@ def _strategy_params(strategy) -> dict:
 # One simulation: a strategy, a date range, and the bars it needs.
 class Backtester:
     # Wire up the manager and the per-run state.
-    def __init__(self, strategy: Strategy, start_date: str, end_date: str | None = None, include_dividends: bool = True) -> None:
+    def __init__(self, strategy: Strategy, start_date: str, end_date: str | None = None, include_dividends: bool = True,
+                 spread_pct: float = 0.0, max_participation: float | None = None,
+                 borrow_rate: float = 0.0, hard_to_borrow: list[str] | set[str] | tuple[str, ...] | None = None) -> None:
+        if spread_pct < 0:
+            raise ValueError(f"spread_pct must be non-negative, got {spread_pct}.")
+        if max_participation is not None and max_participation <= 0:
+            raise ValueError(f"max_participation must be positive, got {max_participation}.")
+        if borrow_rate < 0:
+            raise ValueError(f"borrow_rate must be non-negative, got {borrow_rate}.")
         self.strategy: Strategy = strategy
         self.manager: PortfolioManager = PortfolioManager(strategy)
+        self.manager.SPREAD_PCT = float(spread_pct)
+        self.manager.MAX_PARTICIPATION = None if max_participation is None else float(max_participation)
+        self.manager.BORROW_RATE = float(borrow_rate)
+        self.manager.HARD_TO_BORROW = frozenset(hard_to_borrow) if hard_to_borrow else frozenset()
         self.start_date: str = start_date
         self.end_date: str | None = end_date
         self.include_dividends: bool = include_dividends
@@ -200,6 +212,7 @@ class Backtester:
                 "active_positions": self.manager.active_positions,
                 "total_transaction_cost": float(self.manager.total_cost),
                 "total_trading_cost": float(self.manager.total_trading_cost),
+                "total_borrow_cost": float(self.manager.total_borrow_cost),
             })
 
         self.manager.refresh_view()
@@ -224,6 +237,10 @@ class Backtester:
             "costs": {
                 "fee_rate": self.manager.FEE_RATE,
                 "slippage_pct": self.manager.SLIPPAGE_PCT,
+                "spread_pct": self.manager.SPREAD_PCT,
+                "max_participation": self.manager.MAX_PARTICIPATION,
+                "borrow_rate": self.manager.BORROW_RATE,
+                "hard_to_borrow": sorted(self.manager.HARD_TO_BORROW),
                 "include_dividends": self.include_dividends,
             },
             "strategy": _strategy_params(self.strategy),
@@ -321,6 +338,7 @@ class Backtester:
             "drawdown_recovery": max_duration,
             "unrealized_profit": round(self._unrealized_at_end, 2),
             "dividend_income": round(self.manager.dividend_income, 2),
+            "borrow_cost": round(self.manager.total_borrow_cost, 2),
             "rejected_orders": dict(sorted(self.manager.rejected_orders.items())),
             "equity": self._equity_records,
         }

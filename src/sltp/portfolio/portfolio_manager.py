@@ -5,6 +5,7 @@
 # -------- Imports --------
 import numpy as np
 
+from dataclasses import replace
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
@@ -44,6 +45,12 @@ class PortfolioManager:
         # Trading costs, applied to every fill
         self.SLIPPAGE_PCT: float = 0.0005
         self.FEE_RATE: float = 0.001
+        # One-way spread cost per fill, and the largest share of a bar one fill may take.
+        self.SPREAD_PCT: float = 0.0
+        self.MAX_PARTICIPATION: float | None = None
+        # Annual borrow rate on open shorts, plus tickers that cannot be shorted at all.
+        self.BORROW_RATE: float = 0.0
+        self.HARD_TO_BORROW: frozenset[str] = frozenset()
 
         # Index accounting, starting at 100
         self.starting_equity: float = 100.00
@@ -53,6 +60,8 @@ class PortfolioManager:
         self.dividend_income: float = 0.0
         self.total_cost: float = 0.0
         self.total_slippage: float = 0.0
+        self.total_spread: float = 0.0
+        self.total_borrow_cost: float = 0.0
         self.traded_notional: float = 0.0
 
         # Records
@@ -113,10 +122,11 @@ class PortfolioManager:
     def open_tickers(self) -> set[str]:
         return set(self._open_tickers)
 
-    # Fees plus slippage, for reporting. Slippage is already inside the fill price.
+    # Fees plus slippage plus spread plus borrow, for reporting.
+    # Slippage and spread are already inside the fill price; borrow is a daily cash debit.
     @property
     def total_trading_cost(self) -> float:
-        return self.total_cost + self.total_slippage
+        return self.total_cost + self.total_slippage + self.total_spread + self.total_borrow_cost
 
     # The equity curve as (dates, equities, cash) arrays.
     @property
@@ -180,14 +190,20 @@ class PortfolioManager:
             self.pending_exits.append(trade_id)
 
     # -------- Filling --------
-    # Fill every queued order at today's open.
+    # Fill every queued order at today's open. What the bar's volume would not
+    # take stays queued for the next open; an order with no bar is still dropped.
     def fill_pending_orders(self, current_date: str, opens: dict[str, float]) -> None:
+        carried: list[Order] = []
         for order in self.pending_orders:
             open_price: float | None = self._get_valid_open_price(order.ticker, opens)
             if open_price is not None:
-                self._fill_order(order, open_price, current_date)
+                remainder: Order | None = self._fill_order(
+                    order, open_price, current_date, self._day_volume(order.ticker, current_date)
+                )
+                if remainder is not None:
+                    carried.append(remainder)
 
-        self.pending_orders.clear()
+        self.pending_orders = carried
 
     # Fill every queued exit at today's open.
     def fill_pending_exits(self, current_date: str, opens: dict[str, float]) -> None:
@@ -242,8 +258,22 @@ class PortfolioManager:
             pct_return: float = direction * (price - trade.entry_price) / trade.entry_price
             unrealized += notional * pct_return
 
-        # Index accounting: starting + realized + dividends - costs + unrealized
-        self.portfolio_value = starting_equity + realized_pnl + dividend_income - total_cost + unrealized
+        # Borrow accrues daily on open shorts, on the marked notional, like a prime broker debit.
+        if self.BORROW_RATE > 0.0:
+            for borrow_trade in self.open_trades.values():
+                if borrow_trade.position_type is not PositionType.SHORT or borrow_trade.entry_price <= 0:
+                    continue
+                mark: float = last_prices.get(borrow_trade.ticker, borrow_trade.entry_price)
+                if mark <= 0:
+                    continue
+                borrow_shares: float = borrow_trade.equity_at_entry * borrow_trade.allocation / borrow_trade.entry_price
+                daily_fee: float = borrow_shares * mark * self.BORROW_RATE / 252.0
+                borrow_trade.borrow_cost += daily_fee
+                self.total_borrow_cost += daily_fee
+                self.cash -= daily_fee
+
+        # Index accounting: starting + realized + dividends - costs - borrow + unrealized
+        self.portfolio_value = starting_equity + realized_pnl + dividend_income - total_cost - self.total_borrow_cost + unrealized
 
         # Append to the primitive logs, overwriting the same day on a second mark
         if self._dates_log and self._dates_log[-1] == current_date:
@@ -284,32 +314,54 @@ class PortfolioManager:
 
     # -------- Helpers --------
     # Validate the constraints, price the fill and record the trade.
-    def _fill_order(self, order: Order, open_price: float, current_date: str) -> None:
+    # Returns the unfilled remainder to carry, or None when the order is done.
+    def _fill_order(self, order: Order, open_price: float, current_date: str, volume: float | None = None) -> Order | None:
         ticker: str = order.ticker
         ticker_lots: list[Trade] = self.lots(ticker)
 
         if open_price <= 0:
             self._reject(f"Invalid open price for ticker: {ticker} | open: {open_price}")
-            return
+            return None
 
         equity_at_entry: float = self.portfolio_value
-        allocation: float = order.calculate_weight(equity_at_entry, self.cash)
+        resolved: float = order.calculate_weight(equity_at_entry, self.cash)
 
         # An available-cash order with no cash left is a no-op, not a rejection.
-        if allocation <= 0.0 and order.sizing is OrderSizing.AVAILABLE:
-            return
+        if resolved <= 0.0 and order.sizing is OrderSizing.AVAILABLE:
+            return None
+
+        # A fill pays its own fee out of the notional, so an oversized order
+        # downsizes to the cash instead of dying on a hairline shortfall.
+        allocation: float = self._affordable_allocation(resolved, equity_at_entry)
 
         if not self._validate_order_constraints(order, ticker, ticker_lots, allocation):
-            return
+            return None
 
-        # Entry slippage always moves against the position
+        # Participation cap: one fill takes at most this share of the bar's
+        # volume, and the rest rejoins the queue for the next open.
+        fill_allocation: float = allocation
+        if self.MAX_PARTICIPATION is not None and volume is not None and equity_at_entry > 0:
+            allowed: float = volume * open_price * self.MAX_PARTICIPATION / equity_at_entry
+            if allowed <= 0.0:
+                return order
+            fill_allocation = min(allocation, allowed)
+
+        # What the bar would not take, in equity fractions. A fill smaller than
+        # a cent would print dust lots day after day, so the order waits whole.
+        unfilled: float = allocation - fill_allocation
+        if unfilled * equity_at_entry >= 0.01 > fill_allocation * equity_at_entry:
+            return order
+
+        # Slippage and spread both move against the position. Spread is the
+        # one-way cost, half the quoted spread, tracked apart from slippage.
         if order.position_type is PositionType.LONG:
-            entry_price: float = round(open_price * (1.0 + self.SLIPPAGE_PCT), 2)
+            slipped_price: float = open_price * (1.0 + self.SLIPPAGE_PCT)
+            raw_entry: float = slipped_price * (1.0 + self.SPREAD_PCT)
         else:
-            entry_price = round(open_price * (1.0 - self.SLIPPAGE_PCT), 2)
-
-        # A fill pays its own fee out of the notional, so a full-book order spends the cash.
-        allocation = self._affordable_allocation(allocation, equity_at_entry)
+            slipped_price = open_price * (1.0 - self.SLIPPAGE_PCT)
+            raw_entry = slipped_price * (1.0 - self.SPREAD_PCT)
+        entry_price: float = round(raw_entry, 2)
+        allocation = fill_allocation
         entry_fee: float = round(equity_at_entry * allocation * self.FEE_RATE, 4)
 
         history: StockData | None = self._histories.get(ticker)
@@ -351,7 +403,8 @@ class PortfolioManager:
 
         notional: float = trade.equity_at_entry * trade.allocation
         shares: float = notional / entry_price
-        self.total_slippage += shares * abs(entry_price - open_price)
+        self.total_slippage += shares * abs(slipped_price - open_price)
+        self.total_spread += shares * abs(raw_entry - slipped_price)
         self.traded_notional += notional
         self._invested_by_ticker[ticker] = self._invested_by_ticker.get(ticker, 0.0) + notional
         self._invested_notional += notional
@@ -363,6 +416,14 @@ class PortfolioManager:
         # Keep later fills in this batch on equity net of earlier entry fees
         self.portfolio_value -= entry_fee
 
+        # Carry what the bar would not take; a remainder under a cent is dust.
+        # Fixed-cash orders carry dollars, the rest carry equity fractions.
+        if unfilled * equity_at_entry >= 0.01:
+            if order.sizing is OrderSizing.FIXED:
+                return replace(order, allocation=order.allocation - fill_allocation * equity_at_entry)
+            return replace(order, allocation=order.allocation - fill_allocation)
+        return None
+
     # Realize one lot: exit slippage, fee, event and profit.
     def _fill_exit(self, trade: Trade, price: float, current_date: str, event_type: EventType) -> None:
         if price <= 0:
@@ -370,16 +431,20 @@ class PortfolioManager:
             return
 
         if trade.position_type is PositionType.LONG:
-            exit_price: float = round(price * (1.0 - self.SLIPPAGE_PCT), 2)
+            slipped_price: float = price * (1.0 - self.SLIPPAGE_PCT)
+            raw_exit: float = slipped_price * (1.0 - self.SPREAD_PCT)
             direction: float = 1.0
         else:
-            exit_price = round(price * (1.0 + self.SLIPPAGE_PCT), 2)
+            slipped_price = price * (1.0 + self.SLIPPAGE_PCT)
+            raw_exit = slipped_price * (1.0 + self.SPREAD_PCT)
             direction = -1.0
+        exit_price: float = round(raw_exit, 2)
 
         notional: float = trade.equity_at_entry * trade.allocation
         shares: float = notional / trade.entry_price
         self.traded_notional += shares * exit_price
-        self.total_slippage += shares * abs(exit_price - price)
+        self.total_slippage += shares * abs(slipped_price - price)
+        self.total_spread += shares * abs(raw_exit - slipped_price)
         self._invested_notional -= notional
 
         ticker_notional: float = self._invested_by_ticker[trade.ticker] - notional
@@ -408,6 +473,17 @@ class PortfolioManager:
             self._open_tickers.remove(trade.ticker)
         self._strategy_view_dirty = True
 
+    # Today's traded volume for the participation cap, or None when unknown.
+    def _day_volume(self, ticker: str, current_date: str) -> float | None:
+        history: StockData | None = self._histories.get(ticker)
+        if history is None or len(history.date_codes) == 0:
+            return None
+        code: int = int(to_code(current_date))
+        index: int = int(np.searchsorted(history.date_codes, code, side="left"))
+        if index < len(history.date_codes) and int(history.date_codes[index]) == code:
+            return float(history.volume[index])
+        return None
+
     # The opening price for a ticker, or None after recording a refusal.
     def _get_valid_open_price(self, ticker: str, opens: dict[str, float]) -> float | None:
         open_price: float | None = opens.get(ticker)
@@ -420,6 +496,11 @@ class PortfolioManager:
     def _validate_order_constraints(self, order: Order, ticker: str, ticker_lots: list[Trade], allocation: float) -> bool:
         if allocation <= 0:
             self._reject(f"Invalid order allocation for ticker: {ticker} | allocation: {allocation}")
+            return False
+
+        # Some names cannot be borrowed at any price.
+        if order.position_type is PositionType.SHORT and ticker in self.HARD_TO_BORROW:
+            self._reject(f"Hard to borrow: {ticker}")
             return False
 
         # Maximum lots per ticker
