@@ -79,13 +79,13 @@ Two extra read-only values are handy inside your logic: `open_tickers` (which ti
 
 ### Step 2: `initialize_universe`, choose what you can trade
 
-As the backtest steps forward, the engine hands you every ticker's history up to the current date and asks: what is tradable today? Add tickers with `add_ticker` (or `add_tickers` for a list, `remove_ticker` to drop one). Return `True` once the universe is ready. Returning `False` tells the engine it isn't ready yet, and it keeps walking forward until you accept.
+As the backtest steps forward, the engine asks one question: what is tradable today? Whether it loads every ticker's bars before asking is decided by your signature (see the performance note below). The fixed list keeps it cheap; the ranking filter pays for the full market. Add tickers with `add_ticker` (or `add_tickers` for a list, `remove_ticker` to drop one). Return `True` once the universe is ready. Returning `False` tells the engine it isn't ready yet, and it keeps walking forward until you accept.
 
 ```python
-def initialize_universe(self, current_date: str, histories: dict) -> bool:
+def initialize_universe(self, current_date: str, histories=None) -> bool:
     self.tickers.clear()
     for ticker in ("SPY", "QQQ", "IWM", "DIA"):
-        if ticker in histories:
+        if ticker in self.available_universe:
             self.add_ticker(ticker)
     return bool(self.tickers)
 ```
@@ -97,7 +97,7 @@ You don't have to hardcode names. Four properties list everything with local dat
 - `available_etfs`, funds only
 - `available_gold`, gold proxies only
 
-That makes custom filters short. Say you want liquid large caps and nothing under five dollars:
+When the universe itself is the question — ranking the whole market each rebalance — declare `histories` with no default and the engine loads every ticker's bars before calling you. Say you want liquid large caps and nothing under five dollars:
 
 ```python
 def initialize_universe(self, current_date: str, histories: dict) -> bool:
