@@ -25,6 +25,8 @@ from sltp.data.market_data_service import get_dividends, get_stock_histories, ge
 # -------- Constants --------
 # How far past the requested start the universe may look for a date it can trade.
 MAX_WARMUP_DAYS: int = 1826
+# As-of universe snapshots kept per date; probe dates never repeat, so a few suffice.
+_ASOF_CACHE_LIMIT: int = 4
 # A cash distribution above the whole pre-dividend share price is a data artefact.
 MAX_DIVIDEND_YIELD: float = 1.0
 
@@ -131,6 +133,7 @@ class Backtester:
         self._has_custom_exit: bool = getattr(strategy.should_exit, "__func__", None) is not Strategy.should_exit
         self._has_resting_exits: bool = False
         self._universe_tickers: set[str] = set()
+        self._asof_cache: dict[str, dict[str, StockData]] = {}
         self._pending_rebalance: bool = False
         self._day_code = np.int32(0)
 
@@ -353,11 +356,15 @@ class Backtester:
         if self._universe_at(start_dt, 0):
             return self._accepted_universe_date(start_dt, 0)
 
+        # The earliest success and the tickers it built, so the winning probe
+        # never has to run (and reload) a second time.
+        best: tuple[int, list[str]] | None = None
         low: int = 0
         high: int = 1
         while True:
             probe: int = min(high, MAX_WARMUP_DAYS)
             if self._universe_at(start_dt, probe):
+                best = (probe, list(self.strategy.tickers))
                 high = probe
                 break
             if probe >= MAX_WARMUP_DAYS:
@@ -369,16 +376,19 @@ class Backtester:
         while high - low > 1:
             middle: int = (low + high) // 2
             if self._universe_at(start_dt, middle):
+                best = (middle, list(self.strategy.tickers))
                 high = middle
             else:
                 low = middle
 
-        # The winning call has to run last, so the strategy keeps the universe it built
-        if not self._universe_at(start_dt, high):
+        if best is None:
             raise ValueError(
                 f"Could not initialize universe from {self.start_date} within {MAX_WARMUP_DAYS} days."
             )
-        return self._accepted_universe_date(start_dt, high)
+        offset, tickers = best
+        self.strategy.tickers.clear()
+        self.strategy.tickers.extend(tickers)
+        return self._accepted_universe_date(start_dt, offset)
 
     # Ask the universe hook for one date, counted in calendar days from the requested start.
     def _universe_at(self, start_dt: datetime, offset: int) -> bool:
@@ -392,17 +402,26 @@ class Backtester:
         return (start_dt + relativedelta(days=offset)).strftime("%Y-%m-%d")
 
     # Call a universe hook, passing as-of histories when the strategy asks for them.
+    # A histories parameter defaulting to None promises the hook ignores it,
+    # so the full-universe load is skipped entirely.
     def _call_universe_hook(self, hook, current_date: str):
-        parameters = inspect.signature(hook).parameters.values()
+        parameters = list(inspect.signature(hook).parameters.values())
         accepts_histories: bool = len(parameters) >= 2 or any(
             parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
         )
         if accepts_histories:
+            histories_param = parameters[1] if len(parameters) >= 2 else None
+            if histories_param is not None and histories_param.default is None:
+                return hook(current_date)
             return hook(current_date, self._histories_as_of(current_date))
         return hook(current_date)
 
     # Every ticker's bars up to the callback date, for universe ranking.
+    # One entry per date asked, so a repeated probe is a dict hit, not a reload.
     def _histories_as_of(self, current_date: str) -> dict[str, StockData]:
+        cached: dict[str, StockData] | None = self._asof_cache.get(current_date)
+        if cached is not None:
+            return dict(cached)
         code = to_code(current_date)
         histories: dict[str, StockData] = {}
         # Ranking only reads back from today, so the files after today cannot contribute.
@@ -411,7 +430,10 @@ class Backtester:
             index: int = int(np.searchsorted(history.date_codes, code, side="right")) - 1
             if index >= 0:
                 histories[ticker] = self._slice_history(history, index)
-        return histories
+        self._asof_cache[current_date] = histories
+        while len(self._asof_cache) > _ASOF_CACHE_LIMIT:
+            self._asof_cache.pop(next(iter(self._asof_cache)))
+        return dict(histories)
 
     # Make sure every ticker the strategy currently wants is loaded.
     def _ensure_universe(self) -> None:

@@ -45,9 +45,9 @@ DATE_FORMAT: str = "%Y-%m-%d"
 PRICE_COLS: list[str] = ["Open", "High", "Low", "Close", "Volume"]
 BAR_COLS: list[str] = ["Symbol", "Date", *PRICE_COLS]
 SYMBOL_CACHE_LIMIT: int = 500
-# Largest selective read: bigger requests go in batches of this size, so a full
-# universe never holds every ticker in memory at once.
-BULK_READ_THRESHOLD: int = 500
+# Largest request served through the shared cache. Bigger requests are read in one
+# pass straight to the caller: batching them would only re-scan the files per batch
+# and churn the cache that selective reads rely on, for identical final bytes.
 
 Scope = Literal["all", "stocks", "missing"]
 
@@ -209,12 +209,15 @@ def get_stock_histories(tickers: list[str], start: str | None = None, end: str |
     _validate_range(start, end)
     symbols: list[str] = [ticker.strip().upper() for ticker in tickers]
 
-    # Big universes go in bounded batches of selected reads. One full scan would hold
-    # every ticker (~240MB peak); one batch holds a few hundred symbols at most.
-    histories: dict[str, StockData] = {}
+    # One read per request, whatever the size. A request bigger than the shared cache
+    # can never benefit from it, so it goes straight to the files in a single pass
+    # instead of cycling batches through a cache it would only evict.
     unique: list[str] = list(dict.fromkeys(symbols))
-    for offset in range(0, len(unique), BULK_READ_THRESHOLD):
-        histories.update(_selected_histories(unique[offset:offset + BULK_READ_THRESHOLD], start, end))
+    if len(unique) > SYMBOL_CACHE_LIMIT:
+        with _LOAD_LOCK:
+            histories: dict[str, StockData] = _read_requested_histories(unique, bar_files_for(start, end))
+    else:
+        histories = _selected_histories(unique, start, end)
 
     result: dict[str, StockData] = {}
     for symbol in symbols:

@@ -25,10 +25,10 @@ class MyStrategy(Strategy):
         super().__init__()
         self.name = "My strategy"
 
-    def initialize_universe(self, current_date: str, histories: dict) -> bool:
+    def initialize_universe(self, current_date: str, histories=None) -> bool:
         return bool(self.tickers)
 
-    def on_rebalance(self, current_date: str, histories: dict) -> None:
+    def on_rebalance(self, current_date: str, histories=None) -> None:
         return None
 
     def run_daily(self, current_date: str) -> None:
@@ -110,6 +110,8 @@ def initialize_universe(self, current_date: str, histories: dict) -> bool:
 ```
 
 Because `data` only reaches the current bar, a filter like this can never peek at the future. Pair it with `REBALANCE_FREQUENCY` and `on_rebalance` to rebuild the list on a schedule instead of every day.
+
+One performance note: declaring `histories` without a default tells the engine to load every ticker's bars before calling you. If your universe is hardcoded (or your rebalance just rotates a fixed list), write `histories=None` instead and the full-universe load is skipped entirely. The same rule applies to `on_rebalance`.
 
 ### Step 3: `on_signal`, the actual decision
 

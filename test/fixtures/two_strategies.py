@@ -25,10 +25,11 @@ class Momentum(Strategy):
         self.MAX_LOTS_PER_TICKER = 1
         self.MIN_BARS_REQUIRED = self.LOOKBACK
 
-    def initialize_universe(self, current_date: str, histories: dict) -> bool:
+    def initialize_universe(self, current_date: str, histories=None) -> bool:
         self.tickers.clear()
+        present = set(self.available_universe)
         for ticker in self.TICKERS:
-            if ticker in histories:
+            if ticker in present:
                 self.add_ticker(ticker)
         return bool(self.tickers)
 
@@ -61,10 +62,11 @@ class Value(Strategy):
         self.MAX_LOTS_PER_TICKER = 1
         self.MIN_BARS_REQUIRED = 1
 
-    def initialize_universe(self, current_date: str, histories: dict) -> bool:
+    def initialize_universe(self, current_date: str, histories=None) -> bool:
         self.tickers.clear()
+        present = set(self.available_universe)
         for ticker in self.TICKERS:
-            if ticker in histories:
+            if ticker in present:
                 self.add_ticker(ticker)
         return bool(self.tickers)
 

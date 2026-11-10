@@ -112,11 +112,13 @@ class Strategy:
 
     # -------- Lifecycle Hooks --------
     # Build the starting universe; the default accepts the declared tickers.
-    def initialize_universe(self, current_date: str, histories: dict[str, StockData]) -> bool:
+    # The None default is a promise the hook ignores histories, so the engine skips loading them.
+    def initialize_universe(self, current_date: str, histories: dict[str, StockData] | None = None) -> bool:
         return bool(self.tickers)
 
     # Refresh self.tickers when REBALANCE_FREQUENCY comes due.
-    def on_rebalance(self, current_date: str, histories: dict[str, StockData]) -> None:
+    # The None default is a promise the hook ignores histories, so the engine skips loading them.
+    def on_rebalance(self, current_date: str, histories: dict[str, StockData] | None = None) -> None:
         return None
 
     # Evaluate one ticker's history and return an order, or None for no trade.

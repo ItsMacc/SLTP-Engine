@@ -92,9 +92,9 @@ def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
             self.MAX_LOTS_PER_TICKER = 1
             self.MIN_BARS_REQUIRED = 1
 
-        def initialize_universe(self, current_date: str, histories: dict) -> bool:
+        def initialize_universe(self, current_date: str, histories=None) -> bool:
             self.tickers.clear()
-            if BENCHMARK_TICKER not in histories:
+            if BENCHMARK_TICKER not in self.available_universe:
                 return False
             self.add_ticker(BENCHMARK_TICKER)
             return True

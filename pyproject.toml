@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sltp"
-version = "0.1.25"
+version = "0.1.26"
 description = "A pure-NumPy daily-bar backtesting engine: point-in-time strategy views, portfolio accounting, metrics, SVG charts and a CLI."
 readme = "README.md"
 requires-python = ">=3.11"
