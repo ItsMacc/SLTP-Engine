@@ -85,6 +85,24 @@ def _red(text: str) -> str:
     return _styled(text, "31")
 
 
+# Colour codes take no room on screen, so a column is measured and padded by the
+# characters a person can see; otherwise a green cell widens its column invisibly
+# and every uncoloured row in that column drifts away from it.
+_ESCAPE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible(text: str) -> str:
+    return _ESCAPE.sub("", text)
+
+
+def _pad_left(text: str, width: int) -> str:
+    return text + " " * max(0, width - len(_visible(text)))
+
+
+def _pad_right(text: str, width: int) -> str:
+    return " " * max(0, width - len(_visible(text))) + text
+
+
 # -------- Formatting --------
 # Signed percentage, so a return always says which way it went.
 def _signed(value: float) -> str:
@@ -256,18 +274,21 @@ def _metric_rows(names: list[str], summaries: list[dict]) -> tuple[list[str], li
 # -------- Output --------
 # Aligned columns: the first is a label, the rest are one column per strategy.
 def _table(headers: list[str], rows: list[list[str]]) -> str:
-    widths: list[int] = [max(len(headers[column]), *(len(row[column]) for row in rows)) for column in range(len(headers))]
+    widths: list[int] = [
+        max([len(_visible(headers[column])), *(len(_visible(row[column])) for row in rows)])
+        for column in range(len(headers))
+    ]
     lines: list[str] = []
 
-    header: str = "  " + headers[0].ljust(widths[0]) + "".join(
-        "   " + headers[column].rjust(widths[column]) for column in range(1, len(headers))
+    header: str = "  " + _pad_left(headers[0], widths[0]) + "".join(
+        "   " + _pad_right(headers[column], widths[column]) for column in range(1, len(headers))
     )
     lines.append(_bold(header))
     lines.append("  " + "─" * (sum(widths) + 3 * (len(widths) - 1)))
     for row in rows:
         lines.append(
-            "  " + row[0].ljust(widths[0]) + "".join(
-                "   " + row[column].rjust(widths[column]) for column in range(1, len(row))
+            "  " + _pad_left(row[0], widths[0]) + "".join(
+                "   " + _pad_right(row[column], widths[column]) for column in range(1, len(row))
             )
         )
     return "\n".join(lines)
