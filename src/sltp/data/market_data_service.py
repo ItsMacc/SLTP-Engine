@@ -613,6 +613,10 @@ def _read_requested_histories(
     end: str | None = None,
 ) -> dict[str, StockData]:
     filters = [("Symbol", "=", symbols[0])] if len(symbols) == 1 else [("Symbol", "in", symbols)]
+    if start is not None:
+        filters.append(("Date", ">=", int(to_code(start))))
+    if end is not None:
+        filters.append(("Date", "<=", int(to_code(end))))
     table: pa.Table = _read_table(BAR_COLS, filters, files)
     return _build_histories(table.to_batches(), table.num_rows, start, end)
 
@@ -662,97 +666,83 @@ def _window_edges(codes: np.ndarray, low_code: int, high_code: int) -> tuple[int
     return lo, hi
 
 
-# Streamed bars into one StockData per symbol; arrays are slices of shared blocks.
+# A column as numpy.
+def _column_values(column) -> np.ndarray:
+    try:
+        return column.to_numpy(zero_copy_only=True)
+    except pa.ArrowInvalid:
+        return column.to_numpy(zero_copy_only=False)
+
+
+# One ticker's bars put back together when a file left them in more than one piece.
+# Sorted by date, and a repeated date keeps the row from the later piece, as before.
+def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
+    codes: np.ndarray = np.concatenate([run[0] for run in runs])
+    columns: list[np.ndarray] = [np.concatenate([run[index] for run in runs]) for index in range(1, 6)]
+    order: np.ndarray = np.argsort(codes, kind="stable")
+    codes = codes[order]
+
+    keep = np.ones(codes.size, dtype=bool)
+    if codes.size > 1:
+        keep[:-1] = codes[1:] != codes[:-1]
+
+    ordered = [values[order][keep] for values in columns]
+    return StockData(
+        ticker=ticker,
+        date_codes=codes[keep],
+        open_price=ordered[0],
+        high=ordered[1],
+        low=ordered[2],
+        close_price=ordered[3],
+        volume=ordered[4],
+    )
+
+
+# Bars into one StockData per symbol, as views of the columns they were read from.
 # Given start/end each symbol is cut here, so callers get one pass over the bars.
 def _build_histories(batches, rows: int, start: str | None = None, end: str | None = None) -> dict[str, StockData]:
     if rows == 0:
         return {}
 
     cut: bool = start is not None or end is not None
-    low_code: int = to_code(start) if start is not None else 0
-    high_code: int = to_code(end) if end is not None else int(np.iinfo(np.int32).max)
+    low_code: int = int(to_code(start)) if start is not None else 0
+    high_code: int = int(to_code(end)) if end is not None else int(np.iinfo(np.int32).max)
 
-    date: np.ndarray = np.empty(rows, dtype=np.int32)
-    prices: dict[str, np.ndarray] = {name: np.empty(rows, dtype=np.float32) for name in ("Open", "High", "Low", "Close")}
-    volume: np.ndarray = np.empty(rows, dtype=np.float32)
-    symbols: np.ndarray = np.empty(rows, dtype=np.int32)
-    ids: dict[str, int] = {}
-    at: int = 0
-
+    pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
     for batch in batches:
-        count: int = batch.num_rows
         encoded = pc.dictionary_encode(batch.column("Symbol"))
-        local = np.array([ids.setdefault(label, len(ids)) for label in encoded.dictionary.to_pylist()], dtype=np.int32)
-        symbols[at:at + count] = local[encoded.indices.to_numpy()]
-        dates = batch.column("Date").to_numpy()
-        date[at:at + count] = dates
-        CALENDAR.register(labels_from_codes(np.unique(dates)))
-        for name, target in prices.items():
-            target[at:at + count] = batch.column(name).to_numpy()
-        volume[at:at + count] = batch.column("Volume").to_numpy()
-        at += count
+        labels: list[str] = encoded.dictionary.to_pylist()
+        indices: np.ndarray = encoded.indices.to_numpy(zero_copy_only=True)
+        if indices.size == 0:
+            continue  # a row group the range filter emptied
+        columns: tuple[np.ndarray, ...] = tuple(
+            _column_values(batch.column(name)) for name in ("Date", "Open", "High", "Low", "Close", "Volume")
+        )
+        date: np.ndarray = columns[0]
+        CALENDAR.register(labels_from_codes(np.unique(date)))
 
-    names: list[str] = [""] * len(ids)
-    for label, index in ids.items():
-        names[index] = label
-
-    # A symbol can run again in a later file, so group its runs instead of replacing them.
-    edges: np.ndarray = np.flatnonzero(symbols[1:] != symbols[:-1]) + 1
-    starts = np.concatenate((np.zeros(1, dtype=np.int64), edges)).tolist()
-    ends = np.concatenate((edges, np.array([at], dtype=np.int64))).tolist()
-
-    runs: dict[str, list[tuple[int, int]]] = {}
-    for start, end in zip(starts, ends):
-        ticker: str = names[symbols[start]]
-        runs.setdefault(ticker, []).append((start, end))
+        # Within one row group the file's own order holds, so equal symbols sit together.
+        edges: np.ndarray = np.flatnonzero(indices[1:] != indices[:-1]) + 1
+        starts = np.concatenate((np.zeros(1, dtype=np.int64), edges)).tolist()
+        ends = np.concatenate((edges, np.array([indices.size], dtype=np.int64))).tolist()
+        for head, tail in zip(starts, ends):
+            ticker: str = labels[indices[head]]
+            if cut:
+                lo, hi = _window_edges(date[head:tail], low_code, high_code)
+                if lo >= hi:
+                    continue
+                head, tail = head + lo, head + hi
+            pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in columns))
 
     histories: dict[str, StockData] = {}
-    for ticker, ranges in runs.items():
-        # The common case: one run, already in date order, stays a view of the shared block.
-        if len(ranges) == 1:
-            head, tail = ranges[0]
-            codes = date[head:tail]
+    for ticker, runs in pieces.items():
+        # The common case: one piece, in date order, stays a view of the read buffer.
+        if len(runs) == 1:
+            codes: np.ndarray = runs[0][0]
             if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
-                lo, hi = _window_edges(codes, low_code, high_code) if cut else (0, codes.size)
-                if lo < hi:
-                    histories[ticker] = StockData.view(
-                        ticker,
-                        codes[lo:hi],
-                        prices["Open"][head + lo:head + hi],
-                        prices["High"][head + lo:head + hi],
-                        prices["Low"][head + lo:head + hi],
-                        prices["Close"][head + lo:head + hi],
-                        volume[head + lo:head + hi],
-                    )
+                histories[ticker] = StockData.view(ticker, *runs[0])
                 continue
-
-        # Merge the runs in date order; a repeated date keeps the row from the newer file.
-        positions = np.concatenate([np.arange(start, end) for start, end in ranges])
-        codes = date[positions]
-        order = np.argsort(codes, kind="stable")
-        positions = positions[order]
-        codes = codes[order]
-
-        keep = np.ones(codes.size, dtype=bool)
-        if codes.size > 1:
-            keep[:-1] = codes[1:] != codes[:-1]
-        positions = positions[keep]
-        codes = codes[keep]
-
-        lo, hi = _window_edges(codes, low_code, high_code) if cut else (0, codes.size)
-        if lo >= hi:
-            continue
-        positions = positions[lo:hi]
-
-        histories[ticker] = StockData(
-            ticker=ticker,
-            date_codes=codes[lo:hi],
-            open_price=prices["Open"][positions],
-            high=prices["High"][positions],
-            low=prices["Low"][positions],
-            close_price=prices["Close"][positions],
-            volume=volume[positions],
-        )
+        histories[ticker] = _merge_runs(ticker, runs)
     return histories
 
 
