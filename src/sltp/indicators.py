@@ -8,6 +8,8 @@
 # -------- Imports --------
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -546,8 +548,310 @@ def SAR(high, low, acceleration: float = 0.02, maximum: float = 0.2) -> np.ndarr
     return out
 
 
+# -------- Streaming State --------
+# Lazy per-(ticker, indicator, parameters) recurrence state for the five indicators
+# that otherwise recompute whole histories every day: EMA, RSI, ATR, ADX and MACD.
+# Each state remembers the last bar it processed and fast-forwards on read, so a
+# backtest pays one warm-up pass per series and one scalar step per day after that.
+# Every update below mirrors its batch loop op for op (same seeds, same order, same
+# NaN rules), so streamed values are bit-identical to the batch arrays at each bar.
+
+
+# EMA smoothing factor, guarded so a bad period still builds a dead state.
+def _ema_weight(period: int) -> float:
+    return 2.0 / (period + 1.0) if period > 0 else 0.0
+
+
+# Division with numpy semantics and no warnings: 0/0 reads NaN, x/0 reads infinity.
+def _sdiv(numerator: float, denominator: float) -> float:
+    if denominator != 0.0:
+        return numerator / denominator
+    if numerator != numerator or numerator == 0.0:
+        return float("nan")
+    return math.copysign(math.inf, numerator) * math.copysign(1.0, denominator)
+
+
+# Maximum with numpy semantics: NaN anywhere reads NaN, exactly like np.maximum.
+def _smax(first: float, second: float) -> float:
+    if first != first or second != second:
+        return float("nan")
+    return first if first >= second else second
+
+
+# One EMA/Wilder recurrence carried forward bar by bar. The seed is the mean of the
+# first window, computed with numpy exactly like the batch version; every later bar
+# applies the same scalar update the batch loop does. Wilder repeats the previous
+# value on a non-finite bar while EMA lets NaN poison the state, matching _wilder
+# and _ema respectively. A start of None resolves to the first finite bar, as _ema
+# does; a non-finite seed window kills the state, as both batch versions do.
+class _SeededAverage:
+    __slots__ = ("alpha", "beta", "period", "start", "freeze", "wilder", "pos", "seeded", "dead", "value", "seed")
+
+    def __init__(self, alpha: float, period: int, start: int | None, freeze: bool, wilder: bool) -> None:
+        self.alpha = alpha
+        self.beta = 1.0 - alpha
+        self.period = period
+        self.start = start
+        self.freeze = freeze
+        self.wilder = wilder
+        self.pos = 0
+        self.seeded = False
+        self.dead = period <= 0
+        self.value = float("nan")
+        self.seed: list[float] = []
+
+    # Fold one bar into the state and return the current value (NaN until seeded).
+    def feed(self, index: int, current: float) -> float:
+        if self.dead:
+            return self.value
+        start = self.start
+        if start is None:
+            if not math.isfinite(current):
+                return self.value
+            self.start = start = index
+        if not self.seeded:
+            if index < start:
+                return self.value
+            self.seed.append(current)
+            if index == start + self.period - 1:
+                seed = self.seed
+                self.seed = []
+                if len(seed) != self.period or not all(map(math.isfinite, seed)):
+                    self.dead = True
+                else:
+                    self.value = float(np.mean(np.asarray(seed, dtype=np.float64)))
+                    self.seeded = True
+            return self.value
+        if self.freeze and not math.isfinite(current):
+            return self.value
+        if self.wilder:
+            self.value = self.value + (current - self.value) * self.alpha
+        else:
+            self.value = current * self.alpha + self.value * self.beta
+        return self.value
+
+    # Advance through values up to and including target, returning today's value.
+    def advance(self, values: np.ndarray, target: int) -> float:
+        current = self.value
+        pos = self.pos
+        while pos <= target:
+            current = self.feed(pos, float(values[pos]))
+            pos += 1
+        self.pos = pos
+        return current
+
+
+# Relative Strength Index carried forward bar by bar: two Wilder-shaped averages of
+# gains and losses with RSI's own seeding (the mean of the first window, first value
+# at bar period) and no finiteness guards, exactly like RSI.
+class _RSIState:
+    __slots__ = ("period", "pos", "previous", "average_gain", "average_loss", "seeded", "dead", "gains", "losses", "value")
+
+    def __init__(self, period: int) -> None:
+        self.period = period
+        self.pos = 0
+        self.previous = float("nan")
+        self.average_gain = float("nan")
+        self.average_loss = float("nan")
+        self.seeded = False
+        self.dead = period <= 0
+        self.gains: list[float] = []
+        self.losses: list[float] = []
+        self.value = float("nan")
+
+    def feed(self, index: int, current: float) -> float:
+        if self.dead:
+            return self.value
+        previous = self.previous
+        self.previous = current
+        if index == 0:
+            return self.value
+        change = current - previous
+        gain = change if change > 0.0 else 0.0
+        loss = -change if change < 0.0 else 0.0
+        if not self.seeded:
+            self.gains.append(gain)
+            self.losses.append(loss)
+            if index == self.period:
+                self.average_gain = float(np.mean(np.asarray(self.gains, dtype=np.float64)))
+                self.average_loss = float(np.mean(np.asarray(self.losses, dtype=np.float64)))
+                self.gains = []
+                self.losses = []
+                self.seeded = True
+                self.value = _rsi_value(self.average_gain, self.average_loss)
+            return self.value
+        span = self.period
+        self.average_gain = (self.average_gain * (span - 1) + gain) / span
+        self.average_loss = (self.average_loss * (span - 1) + loss) / span
+        self.value = _rsi_value(self.average_gain, self.average_loss)
+        return self.value
+
+    def advance(self, values: np.ndarray, target: int) -> float:
+        current = self.value
+        pos = self.pos
+        while pos <= target:
+            current = self.feed(pos, float(values[pos]))
+            pos += 1
+        self.pos = pos
+        return current
+
+
+# Average true range: true range per bar into a Wilder state seeded at bar 1.
+class _ATRState:
+    __slots__ = ("core", "pos")
+
+    def __init__(self, period: int) -> None:
+        self.core = _SeededAverage(1.0 / period if period > 0 else 0.0, period, 1, True, True)
+        self.pos = 0
+
+    def advance(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, target: int) -> float:
+        core = self.core
+        current = core.value
+        pos = self.pos
+        while pos <= target:
+            high_now = float(high[pos])
+            low_now = float(low[pos])
+            if pos == 0:
+                current = core.feed(0, high_now - low_now)
+            else:
+                previous_close = float(close[pos - 1])
+                span = high_now - low_now
+                gap_up = abs(high_now - previous_close)
+                gap_down = abs(low_now - previous_close)
+                current = core.feed(pos, _smax(span, _smax(gap_up, gap_down)))
+            pos += 1
+        self.pos = pos
+        return current
+
+
+# Average directional index: three Wilder states (true range seeded at bar 1, the
+# two directional moves seeded at bar 0) combined into DX, then DX itself
+# Wilder-smoothed from bar period. Needs the full length for the 2*period guard.
+class _ADXState:
+    __slots__ = ("period", "true_range", "plus", "minus", "directional", "pos")
+
+    def __init__(self, period: int) -> None:
+        step = 1.0 / period if period > 0 else 0.0
+        self.period = period
+        self.true_range = _SeededAverage(step, period, 1, True, True)
+        self.plus = _SeededAverage(step, period, 0, True, True)
+        self.minus = _SeededAverage(step, period, 0, True, True)
+        self.directional = _SeededAverage(step, period, period, True, True)
+        self.pos = 0
+
+    def advance(self, high: np.ndarray, low: np.ndarray, close: np.ndarray, target: int, total: int) -> float:
+        if total < 2 * self.period:
+            return float("nan")
+        current = self.directional.value
+        pos = self.pos
+        while pos <= target:
+            high_now = float(high[pos])
+            low_now = float(low[pos])
+            if pos == 0:
+                smooth_tr = self.true_range.feed(0, high_now - low_now)
+                smooth_plus = self.plus.feed(0, 0.0)
+                smooth_minus = self.minus.feed(0, 0.0)
+            else:
+                previous_close = float(close[pos - 1])
+                span = high_now - low_now
+                gap_up = abs(high_now - previous_close)
+                gap_down = abs(low_now - previous_close)
+                smooth_tr = self.true_range.feed(pos, _smax(span, _smax(gap_up, gap_down)))
+                up = high_now - float(high[pos - 1])
+                down = float(low[pos - 1]) - low_now
+                smooth_plus = self.plus.feed(pos, up if up > down and up > 0.0 else 0.0)
+                smooth_minus = self.minus.feed(pos, down if down > up and down > 0.0 else 0.0)
+            plus_di = _sdiv(100.0 * smooth_plus, smooth_tr)
+            minus_di = _sdiv(100.0 * smooth_minus, smooth_tr)
+            total_di = plus_di + minus_di
+            if total_di > 0.0:
+                dx = _sdiv(100.0 * abs(plus_di - minus_di), total_di)
+            else:
+                dx = float("nan")
+            current = self.directional.feed(pos, dx)
+            pos += 1
+        self.pos = pos
+        return current
+
+
+# MACD: fast/slow EMA states seeded around the slow warm-up bar, a signal EMA over
+# their difference, and the mask hiding MACD before the signal line starts.
+class _MACDState:
+    __slots__ = ("fast", "slow", "signal", "pos", "signal_start")
+
+    def __init__(self, fast_period: int, slow_period: int, signal_period: int) -> None:
+        anchor = max(fast_period, slow_period) - 1
+        self.fast = _SeededAverage(_ema_weight(fast_period), fast_period, anchor - fast_period + 1, False, False)
+        self.slow = _SeededAverage(_ema_weight(slow_period), slow_period, anchor - slow_period + 1, False, False)
+        self.signal = _SeededAverage(_ema_weight(signal_period), signal_period, None, False, False)
+        self.pos = 0
+        self.signal_start: int | None = None
+
+    def advance(self, values: np.ndarray, target: int) -> tuple[float, float, float]:
+        macd = signal = histogram = float("nan")
+        pos = self.pos
+        while pos <= target:
+            current = float(values[pos])
+            macd = self.fast.feed(pos, current) - self.slow.feed(pos, current)
+            signal = self.signal.feed(pos, macd)
+            if self.signal_start is None and math.isfinite(signal):
+                self.signal_start = pos
+            if self.signal_start is None or pos < self.signal_start:
+                macd = float("nan")
+            histogram = macd - signal
+            pos += 1
+        self.pos = pos
+        return macd, signal, histogram
+
+
+# Build fresh recurrence state for one streamed indicator configuration.
+def new_stream(name: str, params: tuple):
+    if name == "EMA":
+        (period,) = params
+        return _SeededAverage(_ema_weight(period), period, None, False, False)
+    if name == "RSI":
+        (period,) = params
+        return _RSIState(period)
+    if name == "ATR":
+        (period,) = params
+        return _ATRState(period)
+    if name == "ADX":
+        (period,) = params
+        return _ADXState(period)
+    if name == "MACD":
+        fast_period, slow_period, signal_period = params
+        return _MACDState(fast_period, slow_period, signal_period)
+    raise ValueError(f"streaming is not supported for {name}")
+
+
+# Indicators with a streaming fast path behind Strategy._ta.
+def stream_supported(name: str) -> bool:
+    return name in ("EMA", "RSI", "ATR", "ADX", "MACD")
+
+
+# Advance a state to today's bar; returns today's scalar, or the MACD triple.
+def stream_to(state, name: str, series: tuple, target: int):
+    if name == "EMA":
+        (values,) = series
+        return state.advance(values, target)
+    if name == "RSI":
+        (values,) = series
+        return state.advance(values, target)
+    if name == "ATR":
+        high, low, close = series
+        return state.advance(high, low, close, target)
+    if name == "ADX":
+        high, low, close = series
+        return state.advance(high, low, close, target, close.size)
+    if name == "MACD":
+        (values,) = series
+        return state.advance(values, target)
+    raise ValueError(f"streaming is not supported for {name}")
+
+
 # -------- Exports --------
 __all__ = [
     "AD", "ADX", "ATR", "BBANDS", "CCI", "DEMA", "EMA", "MACD", "MFI", "MOM",
     "OBV", "ROC", "RSI", "SAR", "SMA", "STOCH", "STOCHRSI", "TEMA", "TRIX", "WILLR",
+    "new_stream", "stream_supported", "stream_to",
 ]

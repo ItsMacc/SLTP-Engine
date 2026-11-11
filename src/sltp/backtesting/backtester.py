@@ -143,6 +143,7 @@ class Backtester:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
         self._has_run = True
+        self.strategy._reset_indicator_state()
 
         actual_start: str = self._initialize_universe()
         self._ensure_universe()
@@ -550,6 +551,7 @@ class Backtester:
         data = self._data.get(ticker)
         if data is not None:
             self.strategy._indicator_series = data["series"]
+            self.strategy._indicator_ticker = ticker
 
     # Today's view of one loaded ticker.
     def _history_as_of(self, ticker: str, index: int) -> StockData:

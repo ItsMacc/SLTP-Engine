@@ -31,6 +31,9 @@ INDICATOR_CACHE_LIMIT: int = 256
 # -------- Strategy --------
 # Base class for every strategy: hooks, universe access and indicators.
 class Strategy:
+    # Set False on a strategy to keep every indicator on the batch path below.
+    STREAMING_INDICATORS: bool = True
+
     # Set up the identity, the portfolio limits and the empty universe.
     def __init__(self):
         # -------- Identity --------
@@ -53,6 +56,8 @@ class Strategy:
         # computed from it so far. Both stay None until the first call needs them.
         self._indicator_series: dict[int, np.ndarray] | None = None
         self._indicator_cache: OrderedDict = OrderedDict()
+        self._indicator_ticker: str | None = None
+        self._stream_states: dict = {}
 
     # -------- Universe --------
     # Everything with local price data.
@@ -297,11 +302,35 @@ class Strategy:
             window.append(full)
         return tuple(window)
 
-    # Run one indicator, computing over the whole series once and returning today's window.
+    # Drop per-run indicator state so a reused strategy never carries values across runs.
+    def _reset_indicator_state(self) -> None:
+        self._stream_states = {}
+        self._indicator_cache = OrderedDict()
+        self._indicator_ticker = None
+
+    # Run one indicator and return today's value. The streaming path carries one
+    # scalar state per ticker and configuration forward to today's bar; anything
+    # unsupported, untracked or disabled falls through to the batch cache below.
     def _ta(self, func, params: tuple, arrays: tuple):
         series = self._series_window(arrays)
         if series is None:
             return func(*self._widen(*arrays), *params)
+
+        name = getattr(func, "__name__", "")
+        ticker = self._indicator_ticker
+        if self.STREAMING_INDICATORS and ticker is not None and ta.stream_supported(name):
+            today = arrays[0].size - 1
+            if today < 0:
+                return np.asarray([float("nan")])
+            key = (ticker, name, params, id(series[0]))
+            state = self._stream_states.get(key)
+            if state is None or today < state.pos:
+                state = ta.new_stream(name, params)
+                self._stream_states[key] = state
+            current = ta.stream_to(state, name, series, today)
+            if isinstance(current, tuple):
+                return tuple(np.asarray([value], dtype=np.float64) for value in current)
+            return np.asarray([current], dtype=np.float64)
 
         key: tuple = (func, params, tuple(id(full) for full in series))
         entry = self._indicator_cache.get(key)
