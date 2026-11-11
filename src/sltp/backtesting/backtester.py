@@ -134,6 +134,8 @@ class Backtester:
         self._has_resting_exits: bool = False
         self._universe_tickers: set[str] = set()
         self._asof_cache: dict[str, dict[str, StockData]] = {}
+        self._universe_histories: dict[str, StockData] = {}
+        self._universe_skipped: set[str] = set()
         self._pending_rebalance: bool = False
         self._day_code = np.int32(0)
 
@@ -423,6 +425,23 @@ class Backtester:
         cached: dict[str, StockData] | None = self._asof_cache.get(current_date)
         if cached is not None:
             return dict(cached)
+
+        histories: dict[str, StockData] = {}
+        # A warm-up probe can look past the run's own end date, and the bulk read
+        # stops there; that rare date keeps the old one-shot load.
+        if self.end_date is not None and current_date > self.end_date:
+            histories = self._load_histories(current_date)
+        else:
+            histories = self._cut_histories(current_date)
+
+        self._asof_cache[current_date] = histories
+        while len(self._asof_cache) > _ASOF_CACHE_LIMIT:
+            self._asof_cache.pop(next(iter(self._asof_cache)))
+        return dict(histories)
+
+    # Read the universe for one date straight from the files. Only the runaway
+    # warm-up probe uses this; every normal ranking date is cut from the bulk read.
+    def _load_histories(self, current_date: str) -> dict[str, StockData]:
         code = to_code(current_date)
         histories: dict[str, StockData] = {}
         # Ranking only reads back from today, so the files after today cannot contribute.
@@ -431,10 +450,47 @@ class Backtester:
             index: int = int(np.searchsorted(history.date_codes, code, side="right")) - 1
             if index >= 0:
                 histories[ticker] = self._slice_history(history, index)
-        self._asof_cache[current_date] = histories
-        while len(self._asof_cache) > _ASOF_CACHE_LIMIT:
-            self._asof_cache.pop(next(iter(self._asof_cache)))
-        return dict(histories)
+        return histories
+
+    # Load the whole ranking universe once, over the run's window.
+    # Tickers with no bars anywhere in it are remembered so they are not re-read.
+    def _ensure_universe_histories(self, symbols: list[str]) -> None:
+        missing: list[str] = [
+            symbol for symbol in dict.fromkeys(symbols)
+            if symbol not in self._universe_histories and symbol not in self._universe_skipped
+        ]
+        if not missing:
+            return
+        loaded: dict[str, StockData] = get_stock_histories(missing, self.load_start, self.end_date)
+        for symbol in missing:
+            history: StockData | None = loaded.get(symbol)
+            if history is None:
+                self._universe_skipped.add(symbol)
+            else:
+                self._universe_histories[symbol] = history
+
+    # Cut every ticker's bars to this date's ranking window. The cuts are views of
+    # the arrays already in memory, so a rebalance costs slicing, not reading files.
+    def _cut_histories(self, current_date: str) -> dict[str, StockData]:
+        code = to_code(current_date)
+        low_code = to_code(self._load_start_for(current_date))
+        symbols: list[str] = self.strategy.available_universe
+        self._ensure_universe_histories(symbols)
+
+        histories: dict[str, StockData] = {}
+        for ticker in symbols:
+            history: StockData | None = self._universe_histories.get(ticker)
+            if history is None:
+                continue
+            codes = history.date_codes
+            lo: int = int(np.searchsorted(codes, low_code, side="left"))
+            hi: int = int(np.searchsorted(codes, code, side="right"))
+            # A ticker with no bar inside this window is absent, exactly as a
+            # single-date read would have left it out.
+            if lo >= hi:
+                continue
+            histories[ticker] = self._slice_range(history, lo, hi)
+        return histories
 
     # Make sure every ticker the strategy currently wants is loaded.
     def _ensure_universe(self) -> None:
@@ -569,6 +625,20 @@ class Backtester:
             low=history.low[:end],
             close_price=history.close_price[:end],
             volume=history.volume[:end],
+        )
+
+    # Cut a history to a half-open bar range. Slicing NumPy gives views, so this
+    # shares memory with the bulk read instead of copying it.
+    @staticmethod
+    def _slice_range(history: StockData, lo: int, hi: int) -> StockData:
+        return StockData(
+            ticker=history.ticker,
+            date_codes=history.date_codes[lo:hi],
+            open_price=history.open_price[lo:hi],
+            high=history.high[lo:hi],
+            low=history.low[lo:hi],
+            close_price=history.close_price[lo:hi],
+            volume=history.volume[lo:hi],
         )
 
     # -------- Daily Loop Helpers --------
