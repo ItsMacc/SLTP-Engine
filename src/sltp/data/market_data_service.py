@@ -214,10 +214,12 @@ def get_stock_histories(tickers: list[str], start: str | None = None, end: str |
     # instead of cycling batches through a cache it would only evict.
     unique: list[str] = list(dict.fromkeys(symbols))
     if len(unique) > SYMBOL_CACHE_LIMIT:
-        with _LOAD_LOCK:
-            histories: dict[str, StockData] = _read_requested_histories(unique, bar_files_for(start, end))
-    else:
-        histories = _selected_histories(unique, start, end)
+        # The bulk read already cut every history to this range, so the request order is
+        # the only thing left to apply.
+        histories: dict[str, StockData] = _bulk_histories(unique, start, end)
+        return {symbol: histories[symbol] for symbol in symbols if symbol in histories}
+
+    histories = _selected_histories(unique, start, end)
 
     result: dict[str, StockData] = {}
     for symbol in symbols:
@@ -442,6 +444,29 @@ def _selected_histories(symbols: list[str], start: str | None = None, end: str |
         return {symbol: _SYMBOL_CACHE[symbol] for symbol in wanted if symbol in _SYMBOL_CACHE}
 
 
+# The newest bulk read, kept so a compare or a parameter sweep does not re-read the
+# same bars for every run. The key carries the bar files' signature, the range and the
+# universe, so changed files or a different question miss rather than serve stale bars.
+_BULK_CACHE: OrderedDict[tuple, dict[str, StockData]] = OrderedDict()
+BULK_CACHE_LIMIT: int = 2
+
+
+# A big request: one pass over the files, remembered for the next run that asks for it.
+def _bulk_histories(symbols: list[str], start: str, end: str | None) -> dict[str, StockData]:
+    files: list[str] = bar_files_for(start, end)
+    key: tuple = (_files_signature(files), start, end, len(symbols), hash(frozenset(symbols)))
+    with _LOAD_LOCK:
+        cached: dict[str, StockData] | None = _BULK_CACHE.get(key)
+        if cached is not None:
+            _BULK_CACHE.move_to_end(key)
+            return cached
+        histories: dict[str, StockData] = _read_requested_histories(symbols, files, start, end)
+        _BULK_CACHE[key] = histories
+        while len(_BULK_CACHE) > BULK_CACHE_LIMIT:
+            _BULK_CACHE.popitem(last=False)
+        return histories
+
+
 # One history cut to a date range; the slices stay views because the codes are sorted.
 def _slice_history(history: StockData, start: str, end: str | None) -> StockData | None:
     codes = history.date_codes
@@ -451,14 +476,14 @@ def _slice_history(history: StockData, start: str, end: str | None) -> StockData
         return None
     if lo == 0 and hi == len(codes):
         return history
-    return StockData(
-        ticker=history.ticker,
-        date_codes=codes[lo:hi],
-        open_price=history.open_price[lo:hi],
-        high=history.high[lo:hi],
-        low=history.low[lo:hi],
-        close_price=history.close_price[lo:hi],
-        volume=history.volume[lo:hi],
+    return StockData.view(
+        history.ticker,
+        codes[lo:hi],
+        history.open_price[lo:hi],
+        history.high[lo:hi],
+        history.low[lo:hi],
+        history.close_price[lo:hi],
+        history.volume[lo:hi],
     )
 
 
@@ -580,10 +605,16 @@ def _read_trading_calendar(files: list[str] | None = None) -> np.ndarray:
 
 
 # Only the requested symbols, letting row-group statistics skip the rest.
-def _read_requested_histories(symbols: list[str], files: list[str] | None = None) -> dict[str, StockData]:
+# With a start/end the bars are cut while the block is split, not in a second pass.
+def _read_requested_histories(
+    symbols: list[str],
+    files: list[str] | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, StockData]:
     filters = [("Symbol", "=", symbols[0])] if len(symbols) == 1 else [("Symbol", "in", symbols)]
     table: pa.Table = _read_table(BAR_COLS, filters, files)
-    return _build_histories(table.to_batches(), table.num_rows)
+    return _build_histories(table.to_batches(), table.num_rows, start, end)
 
 
 # Every event of one kind grouped by symbol, so a dividend lookup is a dict hit, not a parquet read.
@@ -624,10 +655,22 @@ def _events_in_range(codes: np.ndarray, amounts: np.ndarray, start: str | None, 
     return codes[keep], amounts[keep]
 
 
+# The half-open bar range covering [low_code, high_code] in sorted date codes.
+def _window_edges(codes: np.ndarray, low_code: int, high_code: int) -> tuple[int, int]:
+    lo: int = int(np.searchsorted(codes, low_code, side="left"))
+    hi: int = int(np.searchsorted(codes, high_code, side="right"))
+    return lo, hi
+
+
 # Streamed bars into one StockData per symbol; arrays are slices of shared blocks.
-def _build_histories(batches, rows: int) -> dict[str, StockData]:
+# Given start/end each symbol is cut here, so callers get one pass over the bars.
+def _build_histories(batches, rows: int, start: str | None = None, end: str | None = None) -> dict[str, StockData]:
     if rows == 0:
         return {}
+
+    cut: bool = start is not None or end is not None
+    low_code: int = to_code(start) if start is not None else 0
+    high_code: int = to_code(end) if end is not None else int(np.iinfo(np.int32).max)
 
     date: np.ndarray = np.empty(rows, dtype=np.int32)
     prices: dict[str, np.ndarray] = {name: np.empty(rows, dtype=np.float32) for name in ("Open", "High", "Low", "Close")}
@@ -667,18 +710,20 @@ def _build_histories(batches, rows: int) -> dict[str, StockData]:
     for ticker, ranges in runs.items():
         # The common case: one run, already in date order, stays a view of the shared block.
         if len(ranges) == 1:
-            start, end = ranges[0]
-            codes = date[start:end]
+            head, tail = ranges[0]
+            codes = date[head:tail]
             if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
-                histories[ticker] = StockData(
-                    ticker=ticker,
-                    date_codes=codes,
-                    open_price=prices["Open"][start:end],
-                    high=prices["High"][start:end],
-                    low=prices["Low"][start:end],
-                    close_price=prices["Close"][start:end],
-                    volume=volume[start:end],
-                )
+                lo, hi = _window_edges(codes, low_code, high_code) if cut else (0, codes.size)
+                if lo < hi:
+                    histories[ticker] = StockData.view(
+                        ticker,
+                        codes[lo:hi],
+                        prices["Open"][head + lo:head + hi],
+                        prices["High"][head + lo:head + hi],
+                        prices["Low"][head + lo:head + hi],
+                        prices["Close"][head + lo:head + hi],
+                        volume[head + lo:head + hi],
+                    )
                 continue
 
         # Merge the runs in date order; a repeated date keeps the row from the newer file.
@@ -691,15 +736,22 @@ def _build_histories(batches, rows: int) -> dict[str, StockData]:
         keep = np.ones(codes.size, dtype=bool)
         if codes.size > 1:
             keep[:-1] = codes[1:] != codes[:-1]
+        positions = positions[keep]
+        codes = codes[keep]
+
+        lo, hi = _window_edges(codes, low_code, high_code) if cut else (0, codes.size)
+        if lo >= hi:
+            continue
+        positions = positions[lo:hi]
 
         histories[ticker] = StockData(
             ticker=ticker,
-            date_codes=codes[keep],
-            open_price=prices["Open"][positions[keep]],
-            high=prices["High"][positions[keep]],
-            low=prices["Low"][positions[keep]],
-            close_price=prices["Close"][positions[keep]],
-            volume=volume[positions[keep]],
+            date_codes=codes[lo:hi],
+            open_price=prices["Open"][positions],
+            high=prices["High"][positions],
+            low=prices["Low"][positions],
+            close_price=prices["Close"][positions],
+            volume=volume[positions],
         )
     return histories
 

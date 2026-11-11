@@ -136,6 +136,7 @@ class Backtester:
         self._asof_cache: dict[str, dict[str, StockData]] = {}
         self._universe_histories: dict[str, StockData] = {}
         self._universe_skipped: set[str] = set()
+        self._cut_cursors: dict[str, tuple[int, int, int]] = {}
         self._pending_rebalance: bool = False
         self._day_code = np.int32(0)
 
@@ -477,14 +478,29 @@ class Backtester:
         symbols: list[str] = self.strategy.available_universe
         self._ensure_universe_histories(symbols)
 
+        cursors: dict[str, tuple[int, int, int]] = self._cut_cursors
         histories: dict[str, StockData] = {}
         for ticker in symbols:
             history: StockData | None = self._universe_histories.get(ticker)
             if history is None:
                 continue
             codes = history.date_codes
-            lo: int = int(np.searchsorted(codes, low_code, side="left"))
-            hi: int = int(np.searchsorted(codes, code, side="right"))
+            cursor: tuple[int, int, int] | None = cursors.get(ticker)
+            # Bars only ever arrive at the end, so a name that did not trade since the
+            # last rebalance keeps its cut and needs no binary search at all.
+            if (
+                cursor is not None
+                and code >= cursor[2]
+                and (cursor[1] >= codes.size or codes[cursor[1]] > code)
+                and (cursor[0] >= cursor[1] or codes[cursor[0]] >= low_code)
+            ):
+                lo, hi = cursor[0], cursor[1]
+            else:
+                lo = int(np.searchsorted(codes, low_code, side="left"))
+                # Searching the tail for the far edge finds the second bound without
+                # a second walk over the whole history.
+                hi = lo + int(np.searchsorted(codes[lo:], code, side="right"))
+                cursors[ticker] = (lo, hi, code)
             # A ticker with no bar inside this window is absent, exactly as a
             # single-date read would have left it out.
             if lo >= hi:
@@ -617,28 +633,28 @@ class Backtester:
     @staticmethod
     def _slice_history(history: StockData, index: int) -> StockData:
         end: int = index + 1
-        return StockData(
-            ticker=history.ticker,
-            date_codes=history.date_codes[:end],
-            open_price=history.open_price[:end],
-            high=history.high[:end],
-            low=history.low[:end],
-            close_price=history.close_price[:end],
-            volume=history.volume[:end],
+        return StockData.view(
+            history.ticker,
+            history.date_codes[:end],
+            history.open_price[:end],
+            history.high[:end],
+            history.low[:end],
+            history.close_price[:end],
+            history.volume[:end],
         )
 
     # Cut a history to a half-open bar range. Slicing NumPy gives views, so this
     # shares memory with the bulk read instead of copying it.
     @staticmethod
     def _slice_range(history: StockData, lo: int, hi: int) -> StockData:
-        return StockData(
-            ticker=history.ticker,
-            date_codes=history.date_codes[lo:hi],
-            open_price=history.open_price[lo:hi],
-            high=history.high[lo:hi],
-            low=history.low[lo:hi],
-            close_price=history.close_price[lo:hi],
-            volume=history.volume[lo:hi],
+        return StockData.view(
+            history.ticker,
+            history.date_codes[lo:hi],
+            history.open_price[lo:hi],
+            history.high[lo:hi],
+            history.low[lo:hi],
+            history.close_price[lo:hi],
+            history.volume[lo:hi],
         )
 
     # -------- Daily Loop Helpers --------

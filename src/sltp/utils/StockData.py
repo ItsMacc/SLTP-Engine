@@ -29,6 +29,15 @@ def _coerce_codes(value) -> np.ndarray:
     raise TypeError(f"Cannot build dates from {array.dtype} values.")
 
 
+# Make an array read-only, unless it already is. Slicing a read-only history hands
+# back read-only views, so the flag is already False most of the time and setting it
+# again costs more than building the object around it.
+def _frozen(value):
+    if isinstance(value, np.ndarray) and value.flags.writeable:
+        value.flags.writeable = False
+    return value
+
+
 # -------- Stock Data --------
 # Read-only container for one ticker's bars.
 @dataclass(frozen=True, init=False)
@@ -56,19 +65,39 @@ class StockData:
         *,
         dates=None,
     ):
-        fields: dict[str, object] = {
-            "ticker": ticker,
-            "date_codes": _coerce_codes(date_codes if date_codes is not None else dates),
-            "open_price": open_price,
-            "high": high,
-            "low": low,
-            "close_price": close_price,
-            "volume": volume,
-        }
-        for name, value in fields.items():
-            if isinstance(value, np.ndarray):
-                value.flags.writeable = False
-            object.__setattr__(self, name, value)
+        put = object.__setattr__
+        put(self, "ticker", ticker)
+        put(self, "date_codes", _frozen(_coerce_codes(date_codes if date_codes is not None else dates)))
+        put(self, "open_price", _frozen(open_price))
+        put(self, "high", _frozen(high))
+        put(self, "low", _frozen(low))
+        put(self, "close_price", _frozen(close_price))
+        put(self, "volume", _frozen(volume))
+
+    # The engine's own slices: the arrays are already int32 date codes from another
+    # StockData, so this skips the coercion above. The result is read-only, like any
+    # other history, because every array is frozen before it is stored.
+    @classmethod
+    def view(
+        cls,
+        ticker: str,
+        date_codes: np.ndarray,
+        open_price,
+        high,
+        low,
+        close_price,
+        volume,
+    ) -> "StockData":
+        instance: StockData = object.__new__(cls)
+        put = object.__setattr__
+        put(instance, "ticker", ticker)
+        put(instance, "date_codes", _frozen(date_codes))
+        put(instance, "open_price", _frozen(open_price))
+        put(instance, "high", _frozen(high))
+        put(instance, "low", _frozen(low))
+        put(instance, "close_price", _frozen(close_price))
+        put(instance, "volume", _frozen(volume))
+        return instance
 
     # -------- Date views --------
     # The bar dates as a sequence of "YYYY-MM-DD" strings.
