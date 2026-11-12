@@ -21,7 +21,7 @@ from sltp.utils.PositionType import PositionType
 from sltp.utils.RebalanceFrequency import RebalanceFrequency
 
 # Database imports
-from sltp.data.market_data_service import get_stock_history
+
 
 
 # -------- Rebalance Arithmetic --------
@@ -77,6 +77,9 @@ class PortfolioManager:
         self._trade_by_id: dict[int, Trade] = {}
         self.rejected_orders: dict[str, int] = {}
         self._histories: dict[str, StockData] = {}
+        # (ticker, date) -> history cut to that date, set by the backtester so fills
+        # in uncached tickers reuse the bulk read instead of querying Parquet mid-run.
+        self._history_loader = None
         self._dividend_events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_dividend_code: int | None = None
 
@@ -144,6 +147,10 @@ class PortfolioManager:
     # Use already-loaded histories instead of querying Parquet on fills.
     def set_history_cache(self, histories: dict[str, StockData]) -> None:
         self._histories = histories
+
+    # The backtester sets this once; fills use it before ever reading files.
+    def set_history_loader(self, loader) -> None:
+        self._history_loader = loader
 
     # Cash distributions per ticker, as sorted (day codes, amount per share) pairs.
     def set_dividend_events(self, events: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
@@ -366,7 +373,11 @@ class PortfolioManager:
 
         history: StockData | None = self._histories.get(ticker)
         if history is None:
-            history = get_stock_history(ticker, end=current_date)
+            if self._history_loader is None:
+                raise ValueError(f"No local data found for {ticker} in master database.")
+            history = self._history_loader(ticker, current_date)
+            if history is None:
+                raise ValueError(f"No local data found for {ticker} in master database.")
         else:
             # Slice the live history up to today so the trade never sees the future
             end: int = int(np.searchsorted(history.date_codes, to_code(current_date), side="right"))

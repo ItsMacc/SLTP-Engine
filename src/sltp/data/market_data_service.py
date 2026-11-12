@@ -3,6 +3,7 @@
 # Universe lists keep delisted symbols too, so a backtest has no survivorship bias.
 
 # -------- Imports --------
+import contextlib
 import os
 import re
 import threading
@@ -197,8 +198,40 @@ def get_trading_calendar(start: str | None = None, end: str | None = None) -> np
     return _cached_value(key, _files_signature(files), build)
 
 
+# -------- Run Guard --------
+# A backtest in flight: direct reads from strategy hooks would bypass the run
+# window (lookahead) and the bulk cache, so the public entries below refuse
+# while one is active. Engine internals call the underscored readers, which
+# stay open. Thread-local so concurrent runs guard independently.
+_RUN_STATE = threading.local()
+
+
+def _run_depth() -> int:
+    return int(getattr(_RUN_STATE, "depth", 0))
+
+
+def _require_outside_run(caller: str) -> None:
+    if _run_depth() > 0:
+        raise RuntimeError(
+            f"{caller} cannot be called from inside a running backtest. "
+            "Use the histories the engine passes to initialize_universe/on_rebalance "
+            "or the data object in on_signal: direct reads bypass the run window "
+            "(lookahead) and the bulk cache."
+        )
+
+
+@contextlib.contextmanager
+def _run_guard():
+    _RUN_STATE.depth = _run_depth() + 1
+    try:
+        yield
+    finally:
+        _RUN_STATE.depth = _run_depth() - 1
+
+
 # One ticker's bars between start and end, inclusive; None on either side means the full range.
 def get_stock_history(ticker: str, start: str | None = None, end: str | None = None) -> StockData:
+    _require_outside_run("get_stock_history")
     start = start or DEFAULT_START
     _validate_range(start, end)
     symbol: str = ticker.strip().upper()
@@ -214,11 +247,17 @@ def get_stock_history(ticker: str, start: str | None = None, end: str | None = N
 
 # Batch form of get_stock_history; tickers with no bars in the range are left out.
 def get_stock_histories(tickers: list[str], start: str | None = None, end: str | None = None) -> dict[str, StockData]:
+    _require_outside_run("get_stock_histories")
     if not tickers:
         return {}
 
     start = start or DEFAULT_START
     _validate_range(start, end)
+    return _get_histories(tickers, start, end)
+
+
+# The engine's own entry: same read, no guard. Only the backtester calls this.
+def _get_histories(tickers: list[str], start: str, end: str | None) -> dict[str, StockData]:
     symbols: list[str] = [ticker.strip().upper() for ticker in tickers]
 
     # One read per request, whatever the size. A request bigger than the shared cache

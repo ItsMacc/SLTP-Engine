@@ -19,7 +19,7 @@ from sltp.utils.StockData import StockData
 from sltp.utils.PositionType import PositionType
 
 # Database imports
-from sltp.data.market_data_service import get_dividends, get_stock_histories, get_trading_calendar
+from sltp.data.market_data_service import get_dividends, get_trading_calendar, _get_histories, _run_guard
 
 
 # -------- Constants --------
@@ -115,6 +115,7 @@ class Backtester:
         self.manager.MAX_PARTICIPATION = None if max_participation is None else float(max_participation)
         self.manager.BORROW_RATE = float(borrow_rate)
         self.manager.HARD_TO_BORROW = frozenset(hard_to_borrow) if hard_to_borrow else frozenset()
+        self.manager.set_history_loader(self._history_for_trade)
         self.start_date: str = start_date
         self.end_date: str | None = end_date
         self.include_dividends: bool = include_dividends
@@ -146,6 +147,12 @@ class Backtester:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
         self._has_run = True
+        with _run_guard():
+            return self._run()
+
+    # The simulation itself, under the read guard so strategy hooks cannot reach
+    # past the run window through the data service.
+    def _run(self) -> dict:
         self.strategy._reset_indicator_state()
 
         actual_start: str = self._initialize_universe()
@@ -447,7 +454,7 @@ class Backtester:
         histories: dict[str, StockData] = {}
         # Ranking only reads back from today, so the files after today cannot contribute.
         window_start: str = self._load_start_for(current_date)
-        for ticker, history in get_stock_histories(self.strategy.available_universe, window_start, current_date).items():
+        for ticker, history in _get_histories(self.strategy.available_universe, window_start, current_date).items():
             index: int = int(np.searchsorted(history.date_codes, code, side="right")) - 1
             if index >= 0:
                 histories[ticker] = self._slice_history(history, index)
@@ -462,13 +469,25 @@ class Backtester:
         ]
         if not missing:
             return
-        loaded: dict[str, StockData] = get_stock_histories(missing, self.load_start, self.end_date)
+        loaded: dict[str, StockData] = _get_histories(missing, self.load_start, self.end_date)
         for symbol in missing:
             history: StockData | None = loaded.get(symbol)
             if history is None:
                 self._universe_skipped.add(symbol)
             else:
                 self._universe_histories[symbol] = history
+
+    # One history for a trade opened in a ticker the handed-over cache never saw,
+    # cut from the same bulk window so a fill never triggers a side read.
+    def _history_for_trade(self, ticker: str, current_date: str) -> StockData | None:
+        self._ensure_universe_histories([ticker])
+        history: StockData | None = self._universe_histories.get(ticker)
+        if history is None:
+            return None
+        index: int = int(np.searchsorted(history.date_codes, to_code(current_date), side="right")) - 1
+        if index < 0:
+            return None
+        return self._slice_history(history, index)
 
     # Cut every ticker's bars to this date's ranking window. The cuts are views of
     # the arrays already in memory, so a rebalance costs slicing, not reading files.
@@ -520,7 +539,7 @@ class Backtester:
         if not missing:
             return
 
-        loaded: dict[str, StockData] = get_stock_histories(missing, self.load_start, self.end_date)
+        loaded: dict[str, StockData] = _get_histories(missing, self.load_start, self.end_date)
         for ticker in missing:
             history: StockData | None = loaded.get(ticker)
             if history is None:

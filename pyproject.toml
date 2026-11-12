@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sltp"
-version = "0.1.30"
-description = "A pure-NumPy daily-bar backtesting engine: point-in-time strategy views, portfolio accounting, metrics, SVG charts and a CLI."
+version = "0.1.31"
+description = "A fast backtesting engine for quantitative finance built to run over 28 years of market data across nearly 11,500 symbols"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -18,7 +18,6 @@ keywords = [
     "finance",
     "stocks",
     "indicators",
-    "equity-curve",
     "numpy",
 ]
 classifiers = [
