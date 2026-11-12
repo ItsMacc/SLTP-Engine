@@ -64,8 +64,8 @@ _LOAD_LOCK = threading.RLock()  # without it, concurrent cold requests each load
 
 
 # -------- Bar Files --------
-# A chunk is market_data_<first>_<last>.parquet; the two years keep other files out.
-CHUNK_PATTERN: re.Pattern = re.compile(r"^market_data_(\d{4})_(\d{4})\.parquet$")
+# A chunk is one calendar year: market_data_<year>.parquet. Nothing else is read.
+CHUNK_PATTERN: re.Pattern = re.compile(r"^market_data_(\d{4})\.parquet$")
 
 
 # Every chunk on disk, oldest first. Empty when the bars still live in one file.
@@ -146,7 +146,8 @@ def bar_files_for(start: str | None, end: str | None) -> list[str]:
         if match is None:
             others.append(path)
             continue
-        chunks.append((int(match.group(1)), int(match.group(2)), path))
+        year = int(match.group(1))
+        chunks.append((year, year, path))
 
     # A single master file cannot be pruned by date, so it is always used whole.
     if not chunks:
@@ -182,7 +183,18 @@ def get_trading_calendar(start: str | None = None, end: str | None = None) -> np
 
     files: list[str] = bar_files_for(start, end)
     key: str = f"trading_calendar:{start}:{end}"
-    return _cached_value(key, _files_signature(files), lambda: _read_trading_calendar(files))
+
+    # Cut to the window while building, not after: the caller slices identically,
+    # so the cached value holds only the sessions the run uses.
+    def build() -> np.ndarray:
+        codes = _read_trading_calendar(files)
+        if start is not None:
+            codes = codes[codes >= to_code(start)]
+        if end is not None:
+            codes = codes[codes <= to_code(end)]
+        return codes
+
+    return _cached_value(key, _files_signature(files), build)
 
 
 # One ticker's bars between start and end, inclusive; None on either side means the full range.

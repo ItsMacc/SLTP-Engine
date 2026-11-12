@@ -12,3 +12,6 @@ data/market/*.parquet
 .idea/workspace.xml
 .idea/shelf/
 .idea/
+
+# scripts
+scripts/*

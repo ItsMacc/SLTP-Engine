@@ -2,7 +2,7 @@
 # Prove that loading only the chunks a backtest touches is lossless.
 #
 # Three claims are checked:
-#   1. A 2020 run selects two of the five chunks.
+#   1. A 2020 run selects only the year files its window touches.
 #   2. A strategy that needs 200 bars of warm-up still trades, so the window the
 #      engine asks for is wide enough.
 #   3. The same strategy over the full file set produces byte-identical results,
