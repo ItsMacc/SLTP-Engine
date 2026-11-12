@@ -3,6 +3,7 @@
 # Universe lists keep delisted symbols too, so a backtest has no survivorship bias.
 
 # -------- Imports --------
+import bisect
 import contextlib
 import os
 import re
@@ -655,21 +656,109 @@ def _read_trading_calendar(files: list[str] | None = None) -> np.ndarray:
     return codes
 
 
-# Only the requested symbols, letting row-group statistics skip the rest.
+# Footer metadata per file, parsed once per file version. Only metadata is kept,
+# never an open handle, so a data refresh can still replace the files underneath.
+_FOOTERS: dict[str, tuple[tuple, object, list[tuple[str | None, str | None]] | None]] = {}
+
+
+# The file's metadata plus each row group's (min, max) Symbol; None when any group lacks statistics.
+def _footer(path: str):
+    signature = _signature(path)
+    entry = _FOOTERS.get(path)
+    if entry is not None and entry[0] == signature:
+        return entry
+    metadata = pq.ParquetFile(path).metadata
+    bounds: list[tuple[str | None, str | None]] | None = []
+    if metadata.num_row_groups:
+        column = next(
+            i for i in range(metadata.num_columns)
+            if metadata.row_group(0).column(i).path_in_schema == "Symbol"
+        )
+        for group in range(metadata.num_row_groups):
+            stats = metadata.row_group(group).column(column).statistics
+            if stats is None or not stats.has_min_max:
+                bounds = None
+                break
+            bounds.append((stats.min, stats.max))
+    entry = (signature, metadata, bounds)
+    _FOOTERS[path] = entry
+    return entry
+
+
+# Row groups of one file that can hold any wanted symbol. `wanted` is sorted.
+def _needed_groups(bounds, wanted: list[str]) -> list[int]:
+    if bounds is None:
+        return []
+    chosen: list[int] = []
+    for group, (low, high) in enumerate(bounds):
+        at = bisect.bisect_left(wanted, low)
+        if at < len(wanted) and wanted[at] <= high:
+            chosen.append(group)
+    return chosen
+
+
+# Only the requested symbols, reading just the row groups their Symbol ranges can touch.
 # With a start/end the bars are cut while the block is split, not in a second pass.
+# A big request streams each file whole (per-group overhead thousands of times would
+# dominate); a small request reads only matching groups, so cached histories stop
+# pinning whole decoded files and top-ups stop decoding them.
 def _read_requested_histories(
     symbols: list[str],
     files: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
 ) -> dict[str, StockData]:
-    filters = [("Symbol", "=", symbols[0])] if len(symbols) == 1 else [("Symbol", "in", symbols)]
-    if start is not None:
-        filters.append(("Date", ">=", int(to_code(start))))
-    if end is not None:
-        filters.append(("Date", "<=", int(to_code(end))))
-    table: pa.Table = _read_table(BAR_COLS, filters, files)
-    return _build_histories(table.to_batches(), table.num_rows, start, end)
+    wanted: list[str] = sorted(set(symbols))
+    if not wanted:
+        return {}
+    # A small request keeps copies so cached histories do not pin whole row groups.
+    copy: bool = len(wanted) <= SYMBOL_CACHE_LIMIT
+    file_list: list[str] = files if files is not None else bar_files()
+    if not copy:
+        filters = [("Symbol", "in", wanted)]
+        if start is not None:
+            filters.append(("Date", ">=", int(to_code(start))))
+        if end is not None:
+            filters.append(("Date", "<=", int(to_code(end))))
+
+        def whole_file_batches():
+            for path in file_list:
+                table = pq.read_table([path], columns=BAR_COLS, filters=filters)
+                yield from table.to_batches()
+                del table
+
+        return _build_histories(whole_file_batches(), 1, start, end, None, False)
+
+    pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
+    cut: bool = start is not None or end is not None
+    low_code: int = int(to_code(start)) if start is not None else 0
+    high_code: int = int(to_code(end)) if end is not None else int(np.iinfo(np.int32).max)
+    wanted_set: frozenset = frozenset(wanted)
+    for path in file_list:
+        _, metadata, bounds = _footer(path)
+        if bounds is None:  # no statistics: fall back to the dataset scan for this file
+            filters = [("Symbol", "in", wanted)]
+            if start is not None:
+                filters.append(("Date", ">=", int(to_code(start))))
+            if end is not None:
+                filters.append(("Date", "<=", int(to_code(end))))
+            table = pq.read_table([path], columns=BAR_COLS, filters=filters)
+            batches = table.to_batches()
+            del table
+        else:
+            groups: list[int] = _needed_groups(bounds, wanted)
+            if not groups:
+                continue
+            reader = pq.ParquetFile(path, metadata=metadata, read_dictionary=["Symbol"])
+            try:
+                table = reader.read_row_groups(groups, columns=BAR_COLS)
+            finally:
+                reader.close()
+            batches = table.to_batches()
+            del table
+        for batch in batches:
+            _accumulate_pieces(pieces, batch, cut, low_code, high_code, wanted_set, copy)
+    return _finalize_histories(pieces)
 
 
 # Every event of one kind grouped by symbol, so a dividend lookup is a dict hit, not a parquet read.
@@ -730,6 +819,16 @@ def _column_values(column) -> np.ndarray:
 def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
     codes: np.ndarray = np.concatenate([run[0] for run in runs])
     columns: list[np.ndarray] = [np.concatenate([run[index] for run in runs]) for index in range(1, 6)]
+    if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
+        return StockData(
+            ticker=ticker,
+            date_codes=codes,
+            open_price=columns[0],
+            high=columns[1],
+            low=columns[2],
+            close_price=columns[3],
+            volume=columns[4],
+        )
     order: np.ndarray = np.argsort(codes, kind="stable")
     codes = codes[order]
 
@@ -749,9 +848,73 @@ def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
     )
 
 
+# One batch split into per-ticker pieces. `wanted` skips wide groups' extra
+# names; `copy` keeps small cached slices from pinning whole decoded groups.
+def _accumulate_pieces(
+    pieces: dict[str, list[tuple[np.ndarray, ...]]],
+    batch,
+    cut: bool,
+    low_code: int,
+    high_code: int,
+    wanted: frozenset | None = None,
+    copy: bool = False,
+) -> None:
+    encoded = pc.dictionary_encode(batch.column("Symbol"))
+    labels: list[str] = encoded.dictionary.to_pylist()
+    indices: np.ndarray = encoded.indices.to_numpy(zero_copy_only=True)
+    if indices.size == 0:
+        return  # a selected group that holds no wanted row
+    columns: tuple[np.ndarray, ...] = tuple(
+        _column_values(batch.column(name)) for name in ("Date", "Open", "High", "Low", "Close", "Volume")
+    )
+    date: np.ndarray = columns[0]
+    CALENDAR.register(labels_from_codes(np.unique(date)))
+
+    # Within one row group the file's own order holds, so equal symbols sit together.
+    edges: np.ndarray = np.flatnonzero(indices[1:] != indices[:-1]) + 1
+    starts = np.concatenate((np.zeros(1, dtype=np.int64), edges)).tolist()
+    ends = np.concatenate((edges, np.array([indices.size], dtype=np.int64))).tolist()
+    for head, tail in zip(starts, ends):
+        ticker: str = labels[indices[head]]
+        if wanted is not None and ticker not in wanted:
+            continue
+        if cut:
+            lo, hi = _window_edges(date[head:tail], low_code, high_code)
+            if lo >= hi:
+                continue
+            head, tail = head + lo, head + hi
+        if copy:
+            pieces.setdefault(ticker, []).append(tuple(column[head:tail].copy() for column in columns))
+        else:
+            pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in columns))
+
+
+# The pile into one StockData per symbol, freeing each ticker's pieces the moment
+# its merged arrays exist so the peak stays one shelf, not two.
+def _finalize_histories(pieces: dict[str, list[tuple[np.ndarray, ...]]]) -> dict[str, StockData]:
+    histories: dict[str, StockData] = {}
+    for ticker in list(pieces.keys()):
+        runs = pieces.pop(ticker)
+        # The common case: one piece, in date order, stays a view of the read buffer.
+        if len(runs) == 1:
+            codes: np.ndarray = runs[0][0]
+            if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
+                histories[ticker] = StockData.view(ticker, *runs[0])
+                continue
+        histories[ticker] = _merge_runs(ticker, runs)
+    return histories
+
+
 # Bars into one StockData per symbol, as views of the columns they were read from.
 # Given start/end each symbol is cut here, so callers get one pass over the bars.
-def _build_histories(batches, rows: int, start: str | None = None, end: str | None = None) -> dict[str, StockData]:
+def _build_histories(
+    batches,
+    rows: int,
+    start: str | None = None,
+    end: str | None = None,
+    wanted: frozenset | None = None,
+    copy: bool = False,
+) -> dict[str, StockData]:
     if rows == 0:
         return {}
 
@@ -761,40 +924,8 @@ def _build_histories(batches, rows: int, start: str | None = None, end: str | No
 
     pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
     for batch in batches:
-        encoded = pc.dictionary_encode(batch.column("Symbol"))
-        labels: list[str] = encoded.dictionary.to_pylist()
-        indices: np.ndarray = encoded.indices.to_numpy(zero_copy_only=True)
-        if indices.size == 0:
-            continue  # a row group the range filter emptied
-        columns: tuple[np.ndarray, ...] = tuple(
-            _column_values(batch.column(name)) for name in ("Date", "Open", "High", "Low", "Close", "Volume")
-        )
-        date: np.ndarray = columns[0]
-        CALENDAR.register(labels_from_codes(np.unique(date)))
-
-        # Within one row group the file's own order holds, so equal symbols sit together.
-        edges: np.ndarray = np.flatnonzero(indices[1:] != indices[:-1]) + 1
-        starts = np.concatenate((np.zeros(1, dtype=np.int64), edges)).tolist()
-        ends = np.concatenate((edges, np.array([indices.size], dtype=np.int64))).tolist()
-        for head, tail in zip(starts, ends):
-            ticker: str = labels[indices[head]]
-            if cut:
-                lo, hi = _window_edges(date[head:tail], low_code, high_code)
-                if lo >= hi:
-                    continue
-                head, tail = head + lo, head + hi
-            pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in columns))
-
-    histories: dict[str, StockData] = {}
-    for ticker, runs in pieces.items():
-        # The common case: one piece, in date order, stays a view of the read buffer.
-        if len(runs) == 1:
-            codes: np.ndarray = runs[0][0]
-            if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
-                histories[ticker] = StockData.view(ticker, *runs[0])
-                continue
-        histories[ticker] = _merge_runs(ticker, runs)
-    return histories
+        _accumulate_pieces(pieces, batch, cut, low_code, high_code, wanted, copy)
+    return _finalize_histories(pieces)
 
 
 # The status file as symbol -> status.

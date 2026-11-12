@@ -539,7 +539,15 @@ class Backtester:
         if not missing:
             return
 
-        loaded: dict[str, StockData] = _get_histories(missing, self.load_start, self.end_date)
+        # Anything the ranking universe already loaded (same window) is reused, not re-read.
+        loaded: dict[str, StockData] = {
+            ticker: self._universe_histories[ticker] for ticker in missing if ticker in self._universe_histories
+        }
+        unread: list[str] = [
+            ticker for ticker in missing if ticker not in loaded and ticker not in self._universe_skipped
+        ]
+        if unread:
+            loaded.update(_get_histories(unread, self.load_start, self.end_date))
         for ticker in missing:
             history: StockData | None = loaded.get(ticker)
             if history is None:
