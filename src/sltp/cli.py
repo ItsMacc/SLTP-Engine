@@ -338,12 +338,15 @@ def _json_payload(named: list[tuple[str, dict]], start: str, end: str) -> str:
 
 
 # -------- Chart --------
-# A file name for a strategy's chart, when the user did not choose one.
-def _chart_path(args, name: str) -> str:
+# A file name for the chart, when the user did not choose one: one strategy
+# keeps its own name, a comparison joins every name with _vs_.
+def _chart_path(args, named: list[tuple[str, dict]]) -> str:
     if args.out:
         return args.out
-    slug: str = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "chart"
-    return f"{slug}.svg"
+    slugs: list[str] = []
+    for name, _ in named:
+        slugs.append(re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "chart")
+    return f"{'_vs_'.join(slugs)[:120]}.svg"
 
 
 # Draw every run on one chart, adding the benchmark when there is only one line.
@@ -398,7 +401,7 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str) -> st
         subtitle=f"{start} → {end} · {sessions} sessions · index starts at 100",
         start_value=100.0,
     )
-    path: str = write_chart(_chart_path(args, named[0][0]), svg)
+    path: str = write_chart(_chart_path(args, named), svg)
     print(f"chart: {path}")
 
     # Only open a window when the user did not choose a destination.
