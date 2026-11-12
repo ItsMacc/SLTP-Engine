@@ -5,6 +5,8 @@
 # -------- Imports --------
 import inspect
 import math
+import sys
+import time
 
 import numpy as np
 
@@ -140,6 +142,9 @@ class Backtester:
         self._cut_cursors: dict[str, tuple[int, int, int]] = {}
         self._pending_rebalance: bool = False
         self._day_code = np.int32(0)
+        self._hook_time: dict[str, float] = {}
+        self._hook_calls: dict[str, int] = {}
+        self._universe_warned: bool = False
 
     # -------- Run --------
     # Simulate the strategy and return metrics, equity, trades, rejections and a stamp.
@@ -168,7 +173,7 @@ class Backtester:
 
             # Strategy lifecycle callbacks come before order processing
             self.manager.refresh_view()
-            self.strategy.run_daily(current_date)
+            self._timed_hook("run_daily", self.strategy.run_daily, current_date)
 
             if self.manager.rebalance_due(current_date):
                 self._pending_rebalance = True
@@ -230,6 +235,7 @@ class Backtester:
             })
 
         self.manager.refresh_view()
+        self._print_hook_breakdown()
         metrics: dict = self.performance_metrics()
         equity: list[dict] = self._equity_records
         return {
@@ -239,6 +245,17 @@ class Backtester:
             "rejections": dict(sorted(self.manager.rejected_orders.items())),
             "stamp": self._stamp(),
         }
+
+    # Where the run's Python time went, by strategy hook. To stderr so it never
+    # pollutes --json output; a slow strategy names itself here.
+    def _print_hook_breakdown(self) -> None:
+        if not self._hook_calls:
+            return
+        print("hook time:", file=sys.stderr)
+        for name in sorted(self._hook_time, key=self._hook_time.get, reverse=True):
+            seconds: float = self._hook_time[name]
+            calls: int = self._hook_calls[name]
+            print(f"  {name:<16} {seconds:>7.2f}s x{calls:>7,}", file=sys.stderr)
 
     # What this run is made of: versions, range, costs and strategy knobs.
     def _stamp(self) -> dict:
@@ -412,6 +429,15 @@ class Backtester:
             raise ValueError("initialize_universe() returned True but declared no tickers.")
         return (start_dt + relativedelta(days=offset)).strftime("%Y-%m-%d")
 
+    # Time one strategy hook call for the end-of-run breakdown.
+    def _timed_hook(self, name: str, hook, *args):
+        start: float = time.perf_counter()
+        try:
+            return hook(*args)
+        finally:
+            self._hook_time[name] = self._hook_time.get(name, 0.0) + (time.perf_counter() - start)
+            self._hook_calls[name] = self._hook_calls.get(name, 0) + 1
+
     # Call a universe hook, passing as-of histories when the strategy asks for them.
     # A histories parameter defaulting to None promises the hook ignores it,
     # so the full-universe load is skipped entirely.
@@ -423,9 +449,9 @@ class Backtester:
         if accepts_histories:
             histories_param = parameters[1] if len(parameters) >= 2 else None
             if histories_param is not None and histories_param.default is None:
-                return hook(current_date)
-            return hook(current_date, self._histories_as_of(current_date))
-        return hook(current_date)
+                return self._timed_hook(hook.__name__, hook, current_date)
+            return self._timed_hook(hook.__name__, hook, current_date, self._histories_as_of(current_date))
+        return self._timed_hook(hook.__name__, hook, current_date)
 
     # Every ticker's bars up to the callback date, for universe ranking.
     # One entry per date asked, so a repeated probe is a dict hit, not a reload.
@@ -460,6 +486,25 @@ class Backtester:
                 histories[ticker] = self._slice_history(history, index)
         return histories
 
+    # Warn once when a large universe is mostly unusable: names with fewer bars
+    # than MIN_BARS_REQUIRED can never rank, so the user sees where the bulk
+    # read went instead of wondering why a full-universe strategy is slow.
+    def _warn_once_for_unusable_symbols(self) -> None:
+        if self._universe_warned or len(self._universe_histories) < 1000:
+            return
+        self._universe_warned = True
+        min_bars: int = int(getattr(self.strategy, "MIN_BARS_REQUIRED", 0) or 0)
+        if min_bars <= 0:
+            return
+        short: int = sum(1 for history in self._universe_histories.values() if len(history.date_codes) < min_bars)
+        if short:
+            total: int = len(self._universe_histories)
+            print(
+                f"note: {total} symbols loaded for ranking; {short} have fewer than "
+                f"{min_bars} bars and can never meet MIN_BARS_REQUIRED.",
+                file=sys.stderr,
+            )
+
     # Load the whole ranking universe once, over the run's window.
     # Tickers with no bars anywhere in it are remembered so they are not re-read.
     def _ensure_universe_histories(self, symbols: list[str]) -> None:
@@ -476,6 +521,7 @@ class Backtester:
                 self._universe_skipped.add(symbol)
             else:
                 self._universe_histories[symbol] = history
+        self._warn_once_for_unusable_symbols()
 
     # One history for a trade opened in a ticker the handed-over cache never saw,
     # cut from the same bulk window so a fill never triggers a side read.
@@ -707,7 +753,7 @@ class Backtester:
                     self._publish_series(ticker)
                     history = self._history_for_date(ticker)
                     if len(history.dates) >= self.strategy.MIN_BARS_REQUIRED:
-                        order = self.strategy.on_signal(ticker, history)
+                        order = self._timed_hook("on_signal", self.strategy.on_signal, ticker, history)
                         if order is not None:
                             self.manager.submit_order(order)
                             if (order.stop_loss > 0 or order.take_profit > 0) and not self._has_resting_exits:
@@ -724,7 +770,7 @@ class Backtester:
                 continue
             for trade in self.manager.lots(ticker):
                 trade.history = history
-                if self.strategy.should_exit(ticker, trade, history):
+                if self._timed_hook("should_exit", self.strategy.should_exit, ticker, trade, history):
                     self.manager.queue_exit(trade.id)
 
     # The strategy's view of one held ticker, ending on today's bar.

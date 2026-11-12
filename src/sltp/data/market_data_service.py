@@ -466,11 +466,22 @@ def _tradable_bars_by_symbol() -> dict[str, int]:
     return _cached_value("tradable_bars", _signature(_catalog_path(), required=False), _read_tradable_bars)
 
 
-# Symbols of the given categories that have bars.
+# Symbols of the given categories that have bars, memoized per file change.
+# Strategies read this on every rebalance; without the cache each call re-reads
+# the catalog and re-sorts ~11k symbols.
 def _tickers_in_categories(kinds: tuple[str, ...]) -> list[str]:
-    categories: dict[str, str] = _categories_by_symbol()
-    available: set[str] = set(_tickers_with_bars())
-    return sorted(symbol for symbol, category in categories.items() if category in kinds and symbol in available)
+    kinds = tuple(sorted(kinds))
+
+    def build() -> list[str]:
+        categories: dict[str, str] = _categories_by_symbol()
+        available: set[str] = set(_tickers_with_bars())
+        return sorted(symbol for symbol, category in categories.items() if category in kinds and symbol in available)
+
+    return _cached_value(
+        f"tickers_in_categories_{'_'.join(kinds)}",
+        (_signature(_catalog_path()), _bars_signature()),
+        build,
+    )
 
 
 # -------- History Helpers --------
