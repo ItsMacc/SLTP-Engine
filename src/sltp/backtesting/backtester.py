@@ -31,6 +31,24 @@ MAX_WARMUP_DAYS: int = 1826
 _ASOF_CACHE_LIMIT: int = 4
 # A cash distribution above the whole pre-dividend share price is a data artefact.
 MAX_DIVIDEND_YIELD: float = 1.0
+# Hook profiling: the first 16,589 calls of a hot hook are timed exactly (two
+# clock reads are cheap at that scale), the rest are timed on whole sampled
+# days only, so untimed days cost the inner loops nothing at all. The sampled
+# budget is the finite-population formula for +-1% (99% accuracy) at 99%
+# confidence: n = n0 / (1 + n0 / remaining) with
+#   n0 = z^2 * p(1-p) / E^2 = 2.576^2 * 0.25 / 0.01^2 = 16,589.
+# (No power of two needed: days are counted with plain modulo, not a bitmask.)
+# p = 1/2 is the worst case (maximum variance), so real timing data lands
+# inside +-1% with room to spare. The absolute count rises with N but never
+# exceeds 16,589; only the fraction falls (50% at N = 16.6k, 0.04% at 39M).
+# The day is the sampling unit, so at least 50 days are always sampled:
+# 16,589 calls can collapse into 3 days on a wide universe, and three days
+# cannot represent 28 years of market regimes. Only these hooks are sampled;
+# the rest fire rarely enough to time always.
+PROFILE_EXACT_CALLS: int = 16_589
+PROFILE_SAMPLE_N0: float = 16589.0
+PROFILE_MIN_SAMPLE_DAYS: int = 50
+PROFILE_SAMPLED_HOOKS: frozenset = frozenset({"on_signal", "should_exit"})
 
 
 # -------- Stamp --------
@@ -156,6 +174,12 @@ class Backtester:
         self._day_code = np.int32(0)
         self._hook_time: dict[str, float] = {}
         self._hook_calls: dict[str, int] = {}
+        # Profiling state: exact-prefix snapshots taken when the prefix ends,
+        # plus the day counts that scale sampled hooks (see _run).
+        self._profile_prefix_time: dict[str, float] = {}
+        self._profile_prefix_calls: dict[str, int] = {}
+        self._profile_remaining_days: int = 0
+        self._profile_sampled_days: int = 0
         self._universe_warned: bool = False
 
     # -------- Run --------
@@ -178,10 +202,36 @@ class Backtester:
         if not calendar:
             raise ValueError("No trading days available between the start date and the loaded data.")
 
+        # Profiling plan, decided once. The leading prefix_days are timed exactly
+        # (the first ~20,000 hot-hook calls, warmup included); later days are
+        # timed one in sample_every, spread evenly so history growth is covered
+        # uniformly. The decision is per day, so untimed days are pure engine.
+        tickers_per_day = max(1, len(self._scan_tickers()))
+        prefix_days = min(len(calendar), (PROFILE_EXACT_CALLS + tickers_per_day - 1) // tickers_per_day)
+        remaining_calls = (len(calendar) - prefix_days) * tickers_per_day
+        if remaining_calls:
+            sampled_calls = PROFILE_SAMPLE_N0 / (1.0 + PROFILE_SAMPLE_N0 / remaining_calls)
+            sample_every = max(1, round(remaining_calls / sampled_calls))
+            sample_every = min(sample_every, max(1, (len(calendar) - prefix_days) // PROFILE_MIN_SAMPLE_DAYS))
+        else:
+            sample_every = 1
+        self._profile_remaining_days = len(calendar) - prefix_days
+        self._profile_sampled_days = 0
+
         self.manager.mark_rebalanced(CALENDAR.label(calendar[0]))
         for day_index, code in enumerate(calendar):
             self._day_code = code
             current_date: str = CALENDAR.label(code)
+
+            # The day's timing decision, made once: everything below reads it.
+            timed_day = day_index < prefix_days or (day_index - prefix_days) % sample_every == 0
+            if day_index == prefix_days:
+                # The exact prefix ends here. What was measured so far stays as
+                # the warmup-inclusive baseline; sampled days scale on top.
+                self._profile_prefix_time = dict(self._hook_time)
+                self._profile_prefix_calls = dict(self._hook_calls)
+            if timed_day and day_index >= prefix_days:
+                self._profile_sampled_days += 1
 
             # Strategy lifecycle callbacks come before order processing
             self.manager.refresh_view()
@@ -220,11 +270,11 @@ class Backtester:
                 bars = self._bars_on()
                 opens = {ticker: bar[0] for ticker, bar in bars.items()}
                 closes = {ticker: bar[3] for ticker, bar in bars.items()}
-            self._process_tickers(current_date, bars)
+            self._process_tickers(current_date, bars, timed_day)
 
             # Custom exits use today's completed data and queue next-open orders
             if self._has_custom_exit and self.manager.open_trades:
-                self._process_custom_exits(current_date, bars)
+                self._process_custom_exits(current_date, bars, timed_day)
 
             # Close-based protective exits use today's final OHLC
             self._check_resting_exits(current_date, bars)
@@ -259,15 +309,31 @@ class Backtester:
         }
 
     # Where the run's Python time went, by strategy hook. To stderr so it never
-    # pollutes --json output; a slow strategy names itself here.
+    # pollutes --json output; a slow strategy names itself here. The time column
+    # starts past the longest hook name, so every row lines up no matter which
+    # hooks a strategy defines.
     def _print_hook_breakdown(self) -> None:
         if not self._hook_calls:
             return
-        print("hook time:", file=sys.stderr)
-        for name in sorted(self._hook_time, key=self._hook_time.get, reverse=True):
+        print(f"hook time: {getattr(self.strategy, 'name', '?')}", file=sys.stderr)
+        width: int = max(len(name) for name in self._hook_time)
+        rows: list = []
+        for name in self._hook_time:
             seconds: float = self._hook_time[name]
             calls: int = self._hook_calls[name]
-            print(f"  {name:<16} {seconds:>7.2f}s x{calls:>7,}", file=sys.stderr)
+            sampled = name in PROFILE_SAMPLED_HOOKS and self._profile_sampled_days > 0
+            if sampled:
+                # Estimate the whole run from the exact prefix plus the sampled
+                # days. A '~' marks rows that are estimates, not measurements.
+                scale = self._profile_remaining_days / self._profile_sampled_days
+                prefix_seconds = self._profile_prefix_time.get(name, 0.0)
+                prefix_calls = self._profile_prefix_calls.get(name, 0)
+                seconds = prefix_seconds + (seconds - prefix_seconds) * scale
+                calls = prefix_calls + round((calls - prefix_calls) * scale)
+            rows.append((name, seconds, calls, sampled))
+        for name, seconds, calls, sampled in sorted(rows, key=lambda row: row[1], reverse=True):
+            mark = "~" if sampled else " "
+            print(f"  {name.ljust(width)}   {seconds:>7.2f}s x{calls:>7,}{mark}", file=sys.stderr)
 
     # What this run is made of: versions, range, costs and strategy knobs.
     def _stamp(self) -> dict:
@@ -442,7 +508,8 @@ class Backtester:
             raise ValueError("initialize_universe() returned True but declared no tickers.")
         return (start_dt + relativedelta(days=offset)).strftime("%Y-%m-%d")
 
-    # Time one strategy hook call for the end-of-run breakdown.
+    # Time one strategy hook call for the end-of-run breakdown. Hot hooks reach
+    # this on timed days only (see the profiling plan in _run).
     def _timed_hook(self, name: str, hook, *args):
         start: float = time.perf_counter()
         try:
@@ -745,7 +812,7 @@ class Backtester:
 
     # -------- Daily Loop Helpers --------
     # Ask the strategy for entries on every name it may still buy.
-    def _process_tickers(self, current_date: str, bars: dict[str, tuple[float, float, float, float]]) -> None:
+    def _process_tickers(self, current_date: str, bars: dict[str, tuple[float, float, float, float]], timed_day: bool) -> None:
         universe: set[str] = self._universe_tickers
         held_tickers: set[str] = self.manager.open_tickers
         ordered: list[str] = list(self.strategy.tickers)
@@ -766,14 +833,17 @@ class Backtester:
                     self._publish_series(ticker)
                     history = self._history_for_date(ticker)
                     if len(history.dates) >= self.strategy.MIN_BARS_REQUIRED:
-                        order = self._timed_hook("on_signal", self.strategy.on_signal, ticker, history)
+                        if timed_day:
+                            order = self._timed_hook("on_signal", self.strategy.on_signal, ticker, history)
+                        else:
+                            order = self.strategy.on_signal(ticker, history)
                         if order is not None:
                             self.manager.submit_order(order)
                             if (order.stop_loss > 0 or order.take_profit > 0) and not self._has_resting_exits:
                                 self._has_resting_exits = True
 
     # Let the strategy close its own positions and queue an exit for the next open.
-    def _process_custom_exits(self, current_date: str, bars: dict[str, tuple[float, float, float, float]]) -> None:
+    def _process_custom_exits(self, current_date: str, bars: dict[str, tuple[float, float, float, float]], timed_day: bool) -> None:
         for ticker in self.manager.open_tickers:
             if ticker not in bars:
                 continue
@@ -783,7 +853,11 @@ class Backtester:
                 continue
             for trade in self.manager.lots(ticker):
                 trade.history = history
-                if self._timed_hook("should_exit", self.strategy.should_exit, ticker, trade, history):
+                if timed_day:
+                    exit_signal = self._timed_hook("should_exit", self.strategy.should_exit, ticker, trade, history)
+                else:
+                    exit_signal = self.strategy.should_exit(ticker, trade, history)
+                if exit_signal:
                     self.manager.queue_exit(trade.id)
 
     # The strategy's view of one held ticker, ending on today's bar.

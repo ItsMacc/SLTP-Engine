@@ -404,7 +404,13 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str) -> st
         start_value=100.0,
     )
     path: str = write_chart(_chart_path(args, named), svg)
-    print(f"chart: {path}")
+    if args.out:
+        # A saved chart is the whole result: say where it went and hand over
+        # the SVG itself, so there is nothing to open just to copy the image.
+        print(f"result saved in '{path}' at {os.path.abspath(path)}")
+        print(svg)
+    else:
+        print(f"chart: {path}")
 
     # Only open a window when the user did not choose a destination.
     if not args.out:
