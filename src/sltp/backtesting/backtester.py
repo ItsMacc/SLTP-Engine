@@ -184,16 +184,17 @@ class Backtester:
 
     # -------- Run --------
     # Simulate the strategy and return metrics, equity, trades, rejections and a stamp.
-    def run(self) -> dict:
+    # Quiet skips the stderr breakdown; fetch it later with hook_breakdown_text().
+    def run(self, quiet: bool = False) -> dict:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
         self._has_run = True
         with _run_guard():
-            return self._run()
+            return self._run(quiet)
 
     # The simulation itself, under the read guard so strategy hooks cannot reach
     # past the run window through the data service.
-    def _run(self) -> dict:
+    def _run(self, quiet: bool = False) -> dict:
         self.strategy._reset_indicator_state()
 
         actual_start: str = self._initialize_universe()
@@ -297,7 +298,8 @@ class Backtester:
             })
 
         self.manager.refresh_view()
-        self._print_hook_breakdown()
+        if not quiet:
+            self._print_hook_breakdown()
         metrics: dict = self.performance_metrics()
         equity: list[dict] = self._equity_records
         return {
@@ -312,10 +314,12 @@ class Backtester:
     # pollutes --json output; a slow strategy names itself here. The time column
     # starts past the longest hook name, so every row lines up no matter which
     # hooks a strategy defines.
-    def _print_hook_breakdown(self) -> None:
+    # The breakdown as text, for callers (like `sltp -o`) that file it instead
+    # of printing it. Empty when nothing was timed.
+    def hook_breakdown_text(self) -> str:
         if not self._hook_calls:
-            return
-        print(f"hook time: {getattr(self.strategy, 'name', '?')}", file=sys.stderr)
+            return ""
+        lines: list[str] = [f"hook time: {getattr(self.strategy, 'name', '?')}"]
         width: int = max(len(name) for name in self._hook_time)
         rows: list = []
         for name in self._hook_time:
@@ -333,7 +337,13 @@ class Backtester:
             rows.append((name, seconds, calls, sampled))
         for name, seconds, calls, sampled in sorted(rows, key=lambda row: row[1], reverse=True):
             mark = "~" if sampled else " "
-            print(f"  {name.ljust(width)}   {seconds:>7.2f}s x{calls:>7,}{mark}", file=sys.stderr)
+            lines.append(f"  {name.ljust(width)}   {seconds:>7.2f}s x{calls:>7,}{mark}")
+        return "\n".join(lines)
+
+    def _print_hook_breakdown(self) -> None:
+        text: str = self.hook_breakdown_text()
+        if text:
+            print(text, file=sys.stderr)
 
     # What this run is made of: versions, range, costs and strategy knobs.
     def _stamp(self) -> dict:

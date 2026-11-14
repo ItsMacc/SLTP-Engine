@@ -231,6 +231,15 @@ def _run(strategy: Strategy, start: str, end: str, dividends: bool) -> dict:
     return Backtester(strategy, start, end, dividends).run()
 
 
+# The same run, but silent: nothing to the terminal. Returns the result plus
+# the hook breakdown as text, so `-o` can file everything instead of printing.
+def _run_quiet(strategy: Strategy, start: str, end: str, dividends: bool) -> tuple[dict, str]:
+    from sltp.backtesting import Backtester
+
+    backtester = Backtester(strategy, start, end, dividends)
+    return backtester.run(quiet=True), backtester.hook_breakdown_text()
+
+
 # Pull the handful of numbers the summary shows out of a run.
 # Positions still open at the end have no exit, so they have no return to score: a
 # win rate over zero closed trades is not 0%, it is unknown, and the report says so.
@@ -352,7 +361,9 @@ def _chart_path(args, named: list[tuple[str, dict]]) -> str:
 
 
 # Draw every run on one chart, adding the benchmark when there is only one line.
-def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str) -> str:
+# With -o, `prefix` (breakdown plus report) goes into the file ahead of the
+# SVG, and the terminal hears only where the file went.
+def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefix: str = "") -> str:
     from sltp.graphs import ChartSeries, equity_chart, write_chart
     from sltp.strategy import Strategy
     from sltp.utils import Order, PositionType
@@ -389,11 +400,15 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str) -> st
 
     if len(series) < 2:
         try:
-            benchmark = _run(_BuyAndHold(), start, end, not args.no_dividends)
+            if args.out:
+                benchmark, _ = _run_quiet(_BuyAndHold(), start, end, not args.no_dividends)
+            else:
+                benchmark = _run(_BuyAndHold(), start, end, not args.no_dividends)
             if benchmark["equity"]:
                 series.append(ChartSeries.from_equity(BENCHMARK_NAME, benchmark["equity"], color=BENCHMARK_COLOR))
         except Exception as error:
-            print(f"note: no benchmark line ({error})", file=sys.stderr)
+            if not args.out:
+                print(f"note: no benchmark line ({error})", file=sys.stderr)
 
     title: str = named[0][0] if len(named) == 1 else "Strategy comparison"
     sessions: int = len(named[0][1]["equity"])
@@ -403,13 +418,15 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str) -> st
         subtitle=f"{start} → {end} · {sessions} sessions · index starts at 100",
         start_value=100.0,
     )
-    path: str = write_chart(_chart_path(args, named), svg)
+    path: str = _chart_path(args, named)
     if args.out:
-        # A saved chart is the whole result: say where it went and hand over
-        # the SVG itself, so there is nothing to open just to copy the image.
-        print(f"result saved in '{path}' at {os.path.abspath(path)}")
-        print(svg)
+        # The file is the whole result: breakdown, report, then the chart.
+        # The terminal hears only where it went.
+        document: str = (prefix + "\n\n" if prefix else "") + svg + "\n"
+        path = write_chart(path, document)
+        print(f"results saved in '{path}' at {os.path.abspath(path)}")
     else:
+        path = write_chart(path, svg)
         print(f"chart: {path}")
 
     # Only open a window when the user did not choose a destination.
@@ -434,18 +451,26 @@ def _command_backtest(args) -> int:
         )
 
     strategy = _instantiate(classes[0])
-    result = _run(strategy, args.start, args.end, not args.no_dividends)
+    if args.out:
+        result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends)
+    else:
+        result, breakdown = _run(strategy, args.start, args.end, not args.no_dividends), ""
     named: list[tuple[str, dict]] = [(strategy.name, result)]
 
     if args.json:
         print(_json_payload(named, args.start, args.end))
+        prefix = breakdown
+    elif args.out:
+        report = _report(strategy.name, _summary(result), args.start, args.end)
+        prefix = f"{breakdown}\n\n{report}" if breakdown else report
     else:
         print()
         print(_report(strategy.name, _summary(result), args.start, args.end))
         print()
+        prefix = ""
 
     if args.chart or args.out:
-        _emit_chart(args, named, args.start, args.end)
+        _emit_chart(args, named, args.start, args.end, prefix)
     return 0
 
 
@@ -473,21 +498,32 @@ def _command_compare(args) -> int:
             strategy.name = f"{strategy.name} ({renamed[strategy.name]})"
 
     named: list[tuple[str, dict]] = []
+    breakdowns: list[str] = []
     for strategy in strategies:
-        named.append((strategy.name, _run(strategy, args.start, args.end, not args.no_dividends)))
+        if args.out:
+            result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends)
+            named.append((strategy.name, result))
+            if breakdown:
+                breakdowns.append(breakdown)
+        else:
+            named.append((strategy.name, _run(strategy, args.start, args.end, not args.no_dividends)))
 
+    summaries = [_summary(result) for _, result in named]
+    headers, rows = _metric_rows([name for name, _ in named], summaries)
+    report = _table(["", *headers], rows) + "\n" + f"  {args.start} → {args.end} · {summaries[0]['sessions']} sessions"
     if args.json:
         print(_json_payload(named, args.start, args.end))
+        prefix = "\n\n".join(breakdowns)
+    elif args.out:
+        prefix = "\n\n".join([*breakdowns, report]) if breakdowns else report
     else:
-        summaries = [_summary(result) for _, result in named]
-        headers, rows = _metric_rows([name for name, _ in named], summaries)
         print()
-        print(_table(["", *headers], rows))
-        print(_dim(f"  {args.start} → {args.end} · {summaries[0]['sessions']} sessions"))
+        print(report)
         print()
+        prefix = ""
 
     if args.chart or args.out:
-        _emit_chart(args, named, args.start, args.end)
+        _emit_chart(args, named, args.start, args.end, prefix)
     return 0
 
 
@@ -648,7 +684,7 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "-o", "--out", metavar="FILE",
-        help="write the chart to FILE instead of the default name (implies --chart)",
+        help="write everything (breakdown, report, chart) to FILE; the terminal stays quiet (implies --chart)",
     )
 
 
