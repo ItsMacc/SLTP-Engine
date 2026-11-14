@@ -32,6 +32,9 @@ CACHE_MARKET_DIR: Path = CACHE_ROOT / "MARKET_DAILY"
 CACHE_SYMBOL_DIR: Path = CACHE_ROOT / "SYMBOL_DATA"
 # One process checks the published version once; later calls trust the marker.
 _VERSION_CHECKED: bool = False
+# True while `sltp data update` runs: an explicit refresh downloads even when
+# the user turned auto-update off for ordinary runs.
+_REFRESHING: bool = False
 # The manifest, parsed once per process.
 _MANIFEST: dict | None = None
 # The browser's download function, set once at startup. The desktop never sets it,
@@ -130,6 +133,13 @@ def ensure_local(key: str, cache_root: Path = CACHE_ROOT, fetch=None, size: int 
     dest = cache_root / key
     if dest.is_file() and (size is None or dest.stat().st_size == size):
         return dest
+    from sltp.data import config as _config
+
+    if not _REFRESHING and not _config.auto_update():
+        raise RuntimeError(
+            f"{dest.name} is not cached and auto-update is off;"
+            " run `sltp data update` once or `sltp data auto on` to fetch it"
+        )
     _resolve_fetch(fetch)(f"{REMOTE_BASE_URL}/{key}", dest)
     return dest
 
@@ -141,6 +151,10 @@ def _check_version(fetch=None, cache_root: Path = CACHE_ROOT) -> None:
     if _VERSION_CHECKED:
         return
     _VERSION_CHECKED = True
+    from sltp.data import config as _config
+
+    if not _REFRESHING and not _config.auto_update():
+        return
     if cache_is_fresh(cache_root, fetch):
         return
     reset_manifest()
@@ -196,3 +210,32 @@ def sync_bars(start: str | None, end: str | None, fetch=None, cache_root: Path =
             synced.append(ensure_local(entry["key"], cache_root, fetch, entry.get("bytes")))
     (cache_root / "version.txt").write_text(manifest["version"], encoding="utf-8")
     return synced
+
+
+# True when the network is off-limits: auto-update is off and nobody explicitly
+# asked for a refresh. Sync entry points check this before touching R2.
+def offline() -> bool:
+    from sltp.data import config as _config
+
+    return not _REFRESHING and not _config.auto_update()
+
+
+# Refresh every chunk from R2 regardless of the auto-update choice: the user
+# asked for it out loud. Returns the published version and what came down.
+def refresh_all(fetch=None, cache_root: Path = CACHE_ROOT) -> dict:
+    global _VERSION_CHECKED, _REFRESHING
+    _VERSION_CHECKED = False
+    _REFRESHING = True
+    try:
+        _check_version(fetch, cache_root)
+        synced = sync_bars(None, None, fetch, cache_root)
+        sync_catalog(fetch, cache_root)
+        sync_actions(fetch, cache_root)
+    finally:
+        _REFRESHING = False
+    manifest = read_manifest(fetch)
+    return {
+        "version": manifest["version"],
+        "files": len(synced),
+        "bytes": sum(path.stat().st_size for path in synced if path.is_file()),
+    }

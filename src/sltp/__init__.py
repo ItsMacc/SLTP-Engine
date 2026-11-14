@@ -13,6 +13,8 @@
 # -------- Imports --------
 import importlib
 
+from typing import TYPE_CHECKING
+
 
 # -------- Version --------
 try:
@@ -39,6 +41,26 @@ _LAZY_EXPORTS: dict[str, str] = {
     "StockData": "sltp.utils",
     "Trade": "sltp.utils",
 }
+
+
+# Static mirror of the lazy table below, so IDEs and type checkers resolve
+# `from sltp import Strategy` without importing anything. Never costs a numpy
+# import: TYPE_CHECKING is always False at runtime.
+if TYPE_CHECKING:
+    from sltp.backtesting import Backtester
+    from sltp.portfolio import PortfolioManager
+    from sltp.strategy import Strategy
+    from sltp.utils import (
+        CALENDAR,
+        Event,
+        EventType,
+        Order,
+        OrderSizing,
+        PositionType,
+        RebalanceFrequency,
+        StockData,
+        Trade,
+    )
 
 
 def __getattr__(name: str):

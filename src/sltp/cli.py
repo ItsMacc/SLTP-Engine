@@ -48,6 +48,8 @@ examples:
   sltp backtest momentum.py --start 2019-01-01 --chart
   sltp compare value.py momentum.py --out compare.svg
   sltp compare a.py b.py c.py --json > results.json
+  sltp data
+  sltp data update
 
 A strategy is a .py file with a Strategy subclass and a no-argument constructor.
 Add :ClassName to the path when the file defines more than one.
@@ -483,6 +485,144 @@ def _command_compare(args) -> int:
     return 0
 
 
+# -------- Data --------
+# How big a directory is, in MB, counting only parquet files.
+def _parquet_mb(directory: str) -> float:
+    total: int = 0
+    for name in os.listdir(directory):
+        if name.endswith(".parquet"):
+            try:
+                total += os.path.getsize(os.path.join(directory, name))
+            except OSError:
+                pass
+    return round(total / (1 << 20), 1)
+
+
+# `sltp data` with no action, and `sltp data status`: where bars come from.
+def _command_data_status() -> int:
+    from sltp.data import config as _config
+    from sltp.data.paths import has_bars, source
+
+    info = source()
+    kind, directory = info["kind"], info["dir"]
+    auto = _config.auto_update()
+    print(f"source      {'your own files' if kind == 'own' else 'managed cache'}")
+    print(f"directory   {directory}")
+    if kind == "cache":
+        local = info.get("version") or "unknown"
+        print(f"version     {local} (auto-update {'on' if auto else 'off'})")
+        if auto:
+            try:
+                from sltp.data.remote import read_remote_version
+
+                remote = read_remote_version().strip()
+                print(f"latest      {remote}" + (" (up to date)" if remote == local else " (run `sltp data update`)"))
+            except Exception:
+                print("latest      unreachable (offline?)")
+    else:
+        print(f"version     local files (auto-update {'on' if auto else 'off'}; refresh only affects the cache)")
+    try:
+        names = [name for name in os.listdir(directory) if name.endswith(".parquet")]
+    except OSError:
+        names = []
+    print(f"files       {len(names)} parquet files, {_parquet_mb(directory)} MB")
+    return 0
+
+
+# `sltp data update`: pull every chunk from R2, whatever auto says.
+def _command_data_update() -> int:
+    from sltp.data import remote as _remote
+
+    try:
+        result = _remote.refresh_all()
+    except Exception as error:
+        print(f"error: update failed: {error}", file=sys.stderr)
+        return 1
+    print(f"updated to {result['version']}: {result['files']} files, {round(result['bytes'] / (1 << 20), 1)} MB")
+    return 0
+
+
+# `sltp data check`: every bar file must open with the columns the engine reads.
+def _command_data_check(path: str | None) -> int:
+    import pyarrow.parquet as pq
+
+    from sltp.data.paths import has_bars, market_dir
+
+    directory = os.path.abspath(os.path.expanduser(path)) if path else str(market_dir())
+    if not os.path.isdir(directory):
+        print(f"error: no such directory: {directory}", file=sys.stderr)
+        return 1
+    if not has_bars(directory):
+        print(f"error: {directory} holds no bar files (want market_data_YYYY.parquet)", file=sys.stderr)
+        return 1
+    needed = {"Symbol", "Date", "Open", "High", "Low", "Close", "Volume"}
+    bad: int = 0
+    for name in sorted(os.listdir(directory)):
+        if not (name.startswith("market_data_") and name.endswith(".parquet")):
+            continue
+        full = os.path.join(directory, name)
+        try:
+            schema = pq.read_schema(full)
+            names = set(schema.names)
+            missing = sorted(needed - names)
+            rows = pq.ParquetFile(full).metadata.num_rows
+            status = "ok" if not missing and rows > 0 else "FAIL"
+            detail = f"{rows:,} rows"
+            if missing:
+                detail += f", missing columns: {', '.join(missing)}"
+            if rows == 0:
+                detail += ", empty file"
+        except Exception as error:
+            status, detail = "FAIL", f"unreadable ({error})"
+        if status == "FAIL":
+            bad += 1
+        print(f"  {status:<4} {name}  {detail}")
+    print("all files valid" if bad == 0 else f"{bad} file(s) need attention")
+    return 1 if bad else 0
+
+
+def _command_data(args) -> int:
+    from sltp.data import config as _config
+    from sltp.data.paths import has_bars
+
+    action = args.data_command or "status"
+    if action == "status":
+        return _command_data_status()
+    if action == "update":
+        return _command_data_update()
+    if action == "auto":
+        _config.set_auto_update(args.state == "on")
+        print(f"auto-update {args.state}")
+        return 0
+    if action == "use":
+        if args.clear:
+            _config.set_data_override(None)
+            print("using the default bar source")
+            return 0
+        directory = os.path.abspath(os.path.expanduser(args.path))
+        if not os.path.isdir(directory):
+            print(f"error: no such directory: {directory}", file=sys.stderr)
+            return 1
+        if not has_bars(directory):
+            print(f"error: {directory} holds no bar files (want market_data_YYYY.parquet)", file=sys.stderr)
+            return 1
+        _config.set_data_override(directory)
+        print(f"reading bars from {directory}")
+        return 0
+    if action == "check":
+        return _command_data_check(args.path)
+    return 0
+
+
+# `sltp reset`: forget every choice and behave like a fresh install.
+def _command_reset() -> int:
+    from sltp.data import config as _config
+
+    _config.reset()
+    print("settings restored to defaults: managed cache, auto-update on")
+    return 0
+
+
 # -------- Parser --------
 # The flags every run takes.
 def _add_run_flags(parser: argparse.ArgumentParser) -> None:
@@ -534,6 +674,29 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("strategies", nargs="+", metavar="STRATEGY", help="a .py file, or file.py:ClassName")
     _add_run_flags(compare)
 
+    data = subparsers.add_parser(
+        "data",
+        help="where bars come from and how fresh they are",
+        description="Show the bar source, refresh it, or point it at your own files.",
+    )
+    data_sub = data.add_subparsers(dest="data_command", metavar="ACTION")
+    data_sub.add_parser("status", help="show the bar source and freshness (the default)")
+    data_sub.add_parser("update", help="download the latest bars from R2 now")
+    auto = data_sub.add_parser("auto", help="turn background refresh on or off")
+    auto.add_argument("state", choices=["on", "off"], help="on: refresh every run (default); off: stay offline")
+    use = data_sub.add_parser("use", help="read bars from your own directory")
+    use_group = use.add_mutually_exclusive_group(required=True)
+    use_group.add_argument("path", nargs="?", metavar="DIR", help="a directory holding the bar files")
+    use_group.add_argument("--clear", action="store_true", help="forget the directory and use the default")
+    check = data_sub.add_parser("check", help="validate a directory of bar files")
+    check.add_argument("path", nargs="?", metavar="DIR", help="the directory to validate (default: the one in use)")
+
+    reset = subparsers.add_parser(
+        "reset",
+        help="restore all sltp settings to their defaults",
+        description="Forget every choice (data directory, auto-update) and behave like a fresh install. Cached bars stay where they are.",
+    )
+
     return parser
 
 
@@ -547,6 +710,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        if args.command == "data":
+            return _command_data(args)
+        if args.command == "reset":
+            return _command_reset()
         args.start, args.end = _period(args.start, args.end)
         if args.command == "backtest":
             return _command_backtest(args)

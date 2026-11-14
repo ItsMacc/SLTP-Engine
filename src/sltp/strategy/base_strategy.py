@@ -24,8 +24,8 @@ from sltp.data.market_data_service import get_all_tickers, get_available_etfs, g
 
 
 # -------- Constants --------
-# Indicator series kept per strategy: one entry per ticker and indicator configuration.
-INDICATOR_CACHE_LIMIT: int = 256
+# Indicator cache budget
+INDICATOR_CACHE_MAX_BYTES: int = 30 * 1024 * 1024
 
 
 # -------- Strategy --------
@@ -56,6 +56,7 @@ class Strategy:
         # computed from it so far. Both stay None until the first call needs them.
         self._indicator_series: dict[int, np.ndarray] | None = None
         self._indicator_cache: OrderedDict = OrderedDict()
+        self._indicator_cache_bytes: int = 0
         self._indicator_ticker: str | None = None
         self._stream_states: dict = {}
 
@@ -306,6 +307,7 @@ class Strategy:
     def _reset_indicator_state(self) -> None:
         self._stream_states = {}
         self._indicator_cache = OrderedDict()
+        self._indicator_cache_bytes = 0
         self._indicator_ticker = None
 
     # Run one indicator and return today's value. The streaming path carries one
@@ -336,11 +338,29 @@ class Strategy:
         entry = self._indicator_cache.get(key)
         if entry is None:
             computed = func(*self._widen(*series), *params)
-            outputs: tuple = computed if isinstance(computed, tuple) else (computed,)
+            raw: tuple = computed if isinstance(computed, tuple) else (computed,)
+            # float32 halves the entry (~7 significant digits: a 6-digit price
+            # like berk.A's 1234.56 round-trips to <0.0001) while raw bars and
+            # fill accounting stay float32/float64 respectively, so signals and
+            # fills never lose a cent.
+            outputs: tuple = tuple(
+                np.asarray(output, dtype=np.float32) if isinstance(output, np.ndarray) else output
+                for output in raw
+            )
             entry = (outputs, series)
             self._indicator_cache[key] = entry
-            if len(self._indicator_cache) > INDICATOR_CACHE_LIMIT:
-                self._indicator_cache.popitem(last=False)
+            self._indicator_cache_bytes += sum(
+                output.nbytes if isinstance(output, np.ndarray) else 0 for output in outputs
+            )
+            while self._indicator_cache_bytes > INDICATOR_CACHE_MAX_BYTES:
+                _old_key, (old_outputs, _old_series) = self._indicator_cache.popitem(last=False)
+                if _old_key == key:
+                    # Single entry larger than the whole budget: keep it and stop.
+                    self._indicator_cache[key] = entry
+                    break
+                self._indicator_cache_bytes -= sum(
+                    output.nbytes if isinstance(output, np.ndarray) else 0 for output in old_outputs
+                )
 
         outputs = entry[0]
         length: int = arrays[0].size

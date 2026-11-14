@@ -257,13 +257,36 @@ Every run returns the same metrics dictionary:
 | `dividend_income`, `unrealized_profit` | cash distributions received and open profit at the end |
 | `rejected_orders` | count of refused orders by reason |
 
+## Market data
+
+Every run reads bars from the first source that has them:
+
+1. Your own directory, if you set one (`sltp data use`, or `SLTP_DATA_DIR` for one-off runs).
+2. The managed cache in `~/.sltp/cache`, refreshed from R2.
+
+Fresh installs just work: the first run downloads what its dates need, later runs check a version stamp and top up only when R2 moved. Each run records its bar source in `result["stamp"]["data_source"]` (`own:<dir>` or `cache@<version>`), so a number that moved is always explainable. Pin `end_date` and a rerun is byte-identical.
+
+```bash
+sltp data                 # where am I reading from, and how fresh is it
+sltp data update          # pull the latest bars now
+sltp data auto off        # stay offline; run on whatever is cached (default: on)
+sltp data use ./my_bars   # read your own files instead of the cache
+sltp data use --clear     # forget that and go back to the default
+sltp data check ./my_bars # validate a folder before you trust it
+sltp reset                # forget every setting, behave like a fresh install
+```
+
+Bringing your own bars: put one file per year named `market_data_YYYY.parquet` plus `market_actions.parquet` in a folder, with columns `Symbol, Date, Open, High, Low, Close, Volume` (dates as day numbers, rows sorted). Row-group size is our problem, not yours. Run `sltp data check` on the folder, then `sltp data use` it. No network, no surprises: with `auto off` the engine never phones home and runs on local files, warning when they go stale instead of failing.
+
 ## CLI commands
 
-Two commands, `backtest` and `compare`. `STRATEGY` is a `.py` file, and when a file defines several strategies you pick one with `file.py:ClassName`.
+Four commands. `STRATEGY` is a `.py` file, and when a file defines several strategies you pick one with `file.py:ClassName`.
 
 ```
 sltp backtest STRATEGY   run one strategy and report what it did
 sltp compare A B [...]   run two or more strategies over one period and compare them
+sltp data [ACTION]       show, refresh, or redirect the bar source
+sltp reset               restore all settings to their defaults
 ```
 
 | Flag | Meaning |
@@ -288,7 +311,7 @@ sltp compare a.py b.py c.py --json > results.json
 
 First run may take some time, but all subsequent runs will be significantly faster.
 
-Market data lives outside the package. If your bars are not in the default location, set `SLTP_DATA_DIR` before importing.
+Market data lives outside the package. If your bars are not in the default location, point at them once with `sltp data use <dir>` (or set `SLTP_DATA_DIR` for a single run).
 
 A strategy file is ordinary Python. Its folder goes on `sys.path`, so it can import the files sitting next to it.
 

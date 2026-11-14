@@ -49,8 +49,20 @@ def _package_version() -> str:
         return "unknown"
 
 
-# The published data version, or "unknown" when the manifest was never read.
-# Sync paths already parse it, so this costs nothing whenever data was fetched.
+# Where the run's bars came from: "own:<dir>" or "cache@<version>".
+def _data_source() -> str:
+    try:
+        from sltp.data.paths import source
+
+        info = source()
+        if info.get("kind") == "cache":
+            return f"cache@{info.get('version', 'unknown')}"
+        return f"own:{info.get('dir', '?')}"
+    except Exception:
+        return "unknown"
+
+    # The published data version, or "unknown" when the manifest was never read.
+    # Sync paths already parse it, so this costs nothing whenever data was fetched.
 def _data_version() -> str:
     try:
         from sltp.data.remote import read_manifest
@@ -262,6 +274,7 @@ class Backtester:
         return {
             "sltp_version": _package_version(),
             "data_version": _data_version(),
+            "data_source": _data_source(),
             "start": self.start_date,
             "end": self.end_date,
             "actual_start": self._equity_records[0]["date"] if self._equity_records else None,

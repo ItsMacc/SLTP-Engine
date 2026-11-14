@@ -30,7 +30,6 @@ from sltp.data.paths import market_dir, symbol_data_dir, using_remote_cache
 # -------- Paths & Constants --------
 MARKET_DIR: str = str(market_dir())
 SYMBOL_DATA_DIR: str = str(symbol_data_dir())
-MASTER_FILE: str = os.path.join(MARKET_DIR, "market_data.parquet")
 RECENT_FILE: str = os.path.join(MARKET_DIR, "market_data_recent.parquet")
 ACTIONS_FILE: str = os.path.join(MARKET_DIR, "market_actions.parquet")
 CATALOG_FILE: str = os.path.join(SYMBOL_DATA_DIR, "symbol_catalog.parquet")
@@ -90,24 +89,41 @@ def chunk_files() -> list[str]:
 # Pull the R2 chunks a range touches; a no-op whenever local bars exist, so the
 # desktop path never pays for a check it does not need.
 def _ensure_remote_bars(start: str | None, end: str | None) -> None:
-    if using_remote_cache():
-        _remote.sync_bars(start, end)
+    if not using_remote_cache():
+        return
+    if _remote.offline():
+        try:
+            missing: bool = not _list_bar_files()
+        except RuntimeError:
+            missing = True
+        if missing:
+            raise RuntimeError(
+                "no bars cached and auto-update is off;"
+                " run `sltp data update` once or `sltp data auto on` to fetch them"
+            )
+        return
+    _remote.sync_bars(start, end)
 
 
 # The catalog, fetched once on machines without local data.
 def _ensure_remote_catalog() -> None:
-    if using_remote_cache():
-        _remote.sync_catalog()
+    if not using_remote_cache():
+        return
+    if _remote.offline():
+        return
+    _remote.sync_catalog()
 
 
 # The corporate-actions file, fetched once on machines without local data.
 def _ensure_remote_actions() -> None:
-    if using_remote_cache():
-        _remote.sync_actions()
+    if not using_remote_cache():
+        return
+    if _remote.offline():
+        return
+    _remote.sync_actions()
 
 
-# Every file holding bars, oldest first.
-# Chunks replace the master file, and the recent tail is always added last.
+# Every file holding bars, oldest first: one chunk per year plus the recent tail.
 def bar_files() -> list[str]:
     _ensure_remote_bars(None, None)
     return _list_bar_files()
@@ -117,9 +133,10 @@ def bar_files() -> list[str]:
 def _list_bar_files() -> list[str]:
     files: list[str] = chunk_files()
     if not files:
-        if not os.path.exists(MASTER_FILE):
-            raise RuntimeError(f"Market data file not found: {MASTER_FILE}")
-        files = [MASTER_FILE]
+        raise RuntimeError(
+            f"no bar files in {MARKET_DIR} (want market_data_YYYY.parquet);"
+            " run `sltp data update` or point at your own files with `sltp data use`"
+        )
     if os.path.exists(RECENT_FILE) and os.path.getsize(RECENT_FILE) > 0:
         files.append(RECENT_FILE)
     return files
@@ -151,7 +168,7 @@ def bar_files_for(start: str | None, end: str | None) -> list[str]:
         year = int(match.group(1))
         chunks.append((year, year, path))
 
-    # A single master file cannot be pruned by date, so it is always used whole.
+    # No year chunks (only the recent tail, say): nothing to prune by date.
     if not chunks:
         return files
 

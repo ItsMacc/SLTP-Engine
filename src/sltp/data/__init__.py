@@ -4,5 +4,5 @@
 #
 #   from sltp.data.market_data_service import get_stock_history, get_all_tickers
 #
-# The bar files may be one master or a set of chunks; the reader discovers whichever
-# is present. scripts/chunk_market_data.py builds the chunks.
+# The bar files are one chunk per year (market_data_YYYY.parquet) plus the
+# recent tail; the reader discovers whatever the range needs.
