@@ -47,6 +47,10 @@ class Strategy:
         self.REBALANCE_FREQUENCY: RebalanceFrequency = RebalanceFrequency.NEVER
         self.MIN_BARS_REQUIRED: int = 0
         self.LIQUIDATE_ON_END: bool = False
+        # Sessions of history the engine guarantees before the start date, for
+        # indicators and universe ranking. None keeps the five-year default;
+        # set it to trim the bulk read down to what the strategy actually uses.
+        self.LOOKBACK_BARS: int | None = None
 
         # -------- Tickers --------
         self.tickers: list[str] = []

@@ -72,6 +72,7 @@ What each knob does:
 | `REBALANCE_FREQUENCY` | `NEVER` | how often `on_rebalance` fires: `DAILY`, `WEEKLY`, `MONTHLY`, `QUARTERLY`, `YEARLY`, or `NEVER` (import from `sltp`) |
 | `MIN_BARS_REQUIRED` | `0` | bars of history needed before any trading starts |
 | `LIQUIDATE_ON_END` | `False` | close everything on the final session |
+| `LOOKBACK_BARS` | `None` | sessions of history loaded before the start date, for indicators and universe ranking (`None` keeps the five-year default; set it to trim the bulk read to what the strategy actually uses) |
 
 When an order breaks one of these limits, it isn't silently dropped. The rejection is counted by reason in the result's `rejections`, so you can see exactly what stopped you.
 
@@ -296,7 +297,7 @@ sltp reset               restore all settings to their defaults
 | `--no-dividends` | ignore cash distributions |
 | `--json` | print JSON instead of the summary |
 | `-g, --chart` | draw an SVG equity chart and open it |
-| `-o, --out FILE` | write the chart to `FILE` (implies `--chart`) |
+| `-o, --out FILE` | write everything (hook breakdown, report, chart) to `FILE`; the terminal stays quiet (implies `--chart`) |
 | `--version` | print the version |
 
 ```bash

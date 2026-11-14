@@ -26,7 +26,12 @@ from sltp.data.market_data_service import get_dividends, get_trading_calendar, _
 
 # -------- Constants --------
 # How far past the requested start the universe may look for a date it can trade.
-MAX_WARMUP_DAYS: int = 1826
+# A start-date search budget, not a warmup: it bounds the forward probe for a
+# tradable date and has nothing to do with how much history a strategy reads.
+MAX_START_PROBE_DAYS: int = 1826
+# History loaded when a strategy declares no LOOKBACK_BARS of its own: five
+# years of sessions, enough for the hungriest indicator or ranking window.
+DEFAULT_LOOKBACK_DAYS: int = 1826
 # As-of universe snapshots kept per date; probe dates never repeat, so a few suffice.
 _ASOF_CACHE_LIMIT: int = 4
 # A cash distribution above the whole pre-dividend share price is a data artefact.
@@ -122,6 +127,7 @@ def _strategy_params(strategy) -> dict:
             "max_lots_per_ticker": _stamp_scalar(getattr(strategy, "MAX_LOTS_PER_TICKER", None)),
             "rebalance_frequency": _stamp_scalar(getattr(strategy, "REBALANCE_FREQUENCY", None)),
             "min_bars_required": _stamp_scalar(getattr(strategy, "MIN_BARS_REQUIRED", None)),
+            "lookback_bars": _stamp_scalar(getattr(strategy, "LOOKBACK_BARS", None)),
             "liquidate_on_end": _stamp_scalar(getattr(strategy, "LIQUIDATE_ON_END", None)),
         },
         "custom": custom,
@@ -464,9 +470,13 @@ class Backtester:
         }
 
     # -------- Universe and Data --------
-    # The earliest bar a call on current_date may look back on.
+    # The earliest bar a call on current_date may look back on. A strategy that
+    # declares LOOKBACK_BARS gets that many sessions, doubled so weekends and
+    # holidays never eat into it; anything else keeps the five-year default.
     def _load_start_for(self, current_date: str) -> str:
-        return (datetime.strptime(current_date, "%Y-%m-%d") - relativedelta(days=MAX_WARMUP_DAYS)).strftime("%Y-%m-%d")
+        lookback: int | None = self.strategy.LOOKBACK_BARS
+        days: int = DEFAULT_LOOKBACK_DAYS if lookback is None else max(0, lookback * 2)
+        return (datetime.strptime(current_date, "%Y-%m-%d") - relativedelta(days=days)).strftime("%Y-%m-%d")
     # Build the universe, walking the start date forward until the strategy accepts it.
     def _initialize_universe(self) -> str:
         start_dt: datetime = datetime.strptime(self.start_date, "%Y-%m-%d")
@@ -479,14 +489,14 @@ class Backtester:
         low: int = 0
         high: int = 1
         while True:
-            probe: int = min(high, MAX_WARMUP_DAYS)
+            probe: int = min(high, MAX_START_PROBE_DAYS)
             if self._universe_at(start_dt, probe):
                 best = (probe, list(self.strategy.tickers))
                 high = probe
                 break
-            if probe >= MAX_WARMUP_DAYS:
+            if probe >= MAX_START_PROBE_DAYS:
                 raise ValueError(
-                    f"Could not initialize universe from {self.start_date} within {MAX_WARMUP_DAYS} days."
+                    f"Could not initialize universe from {self.start_date} within {MAX_START_PROBE_DAYS} days."
                 )
             low, high = probe, probe * 2
 
@@ -500,7 +510,7 @@ class Backtester:
 
         if best is None:
             raise ValueError(
-                f"Could not initialize universe from {self.start_date} within {MAX_WARMUP_DAYS} days."
+                f"Could not initialize universe from {self.start_date} within {MAX_START_PROBE_DAYS} days."
             )
         offset, tickers = best
         self.strategy.tickers.clear()
