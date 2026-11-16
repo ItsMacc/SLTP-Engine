@@ -224,19 +224,30 @@ def _period(start: str | None, end: str | None) -> tuple[str, str]:
 
 
 # -------- Running --------
+# Friction flags to Backtester knobs. Spread arrives in basis points because
+# that is how traders quote it; the engine takes a fraction.
+def _friction_kwargs(args) -> dict:
+    return {
+        "spread_pct": args.spread_bps / 10_000.0,
+        "max_participation": args.max_participation,
+        "min_fill_notional": args.min_fill,
+        "borrow_rate": args.borrow_rate,
+    }
+
+
 # Run one strategy over the period.
-def _run(strategy: Strategy, start: str, end: str, dividends: bool) -> dict:
+def _run(strategy: Strategy, start: str, end: str, dividends: bool, friction: dict) -> dict:
     from sltp.backtesting import Backtester
 
-    return Backtester(strategy, start, end, dividends).run()
+    return Backtester(strategy, start, end, dividends, **friction).run()
 
 
 # The same run, but silent: nothing to the terminal. Returns the result plus
 # the hook breakdown as text, so `-o` can file everything instead of printing.
-def _run_quiet(strategy: Strategy, start: str, end: str, dividends: bool) -> tuple[dict, str]:
+def _run_quiet(strategy: Strategy, start: str, end: str, dividends: bool, friction: dict) -> tuple[dict, str]:
     from sltp.backtesting import Backtester
 
-    backtester = Backtester(strategy, start, end, dividends)
+    backtester = Backtester(strategy, start, end, dividends, **friction)
     return backtester.run(quiet=True), backtester.hook_breakdown_text()
 
 
@@ -451,10 +462,11 @@ def _command_backtest(args) -> int:
         )
 
     strategy = _instantiate(classes[0])
+    friction = _friction_kwargs(args)
     if args.out:
-        result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends)
+        result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends, friction)
     else:
-        result, breakdown = _run(strategy, args.start, args.end, not args.no_dividends), ""
+        result, breakdown = _run(strategy, args.start, args.end, not args.no_dividends, friction), ""
     named: list[tuple[str, dict]] = [(strategy.name, result)]
 
     if args.json:
@@ -501,12 +513,12 @@ def _command_compare(args) -> int:
     breakdowns: list[str] = []
     for strategy in strategies:
         if args.out:
-            result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends)
+            result, breakdown = _run_quiet(strategy, args.start, args.end, not args.no_dividends, _friction_kwargs(args))
             named.append((strategy.name, result))
             if breakdown:
                 breakdowns.append(breakdown)
         else:
-            named.append((strategy.name, _run(strategy, args.start, args.end, not args.no_dividends)))
+            named.append((strategy.name, _run(strategy, args.start, args.end, not args.no_dividends, _friction_kwargs(args))))
 
     summaries = [_summary(result) for _, result in named]
     headers, rows = _metric_rows([name for name, _ in named], summaries)
@@ -708,6 +720,22 @@ def _add_run_flags(parser: argparse.ArgumentParser) -> None:
         help="last session, YYYY-MM-DD (default: the latest session on disk)",
     )
     parser.add_argument("--no-dividends", action="store_true", help="ignore cash distributions")
+    parser.add_argument(
+        "--spread-bps", type=float, default=0.0, metavar="BPS",
+        help="one-way spread paid on every fill, in basis points (default: 0)",
+    )
+    parser.add_argument(
+        "--max-participation", type=float, default=None, metavar="FRAC",
+        help="largest share of a bar's volume one fill may take, 0-1; the rest waits for the next open (default: no cap)",
+    )
+    parser.add_argument(
+        "--min-fill", type=float, default=0.01, metavar="DOLLARS",
+        help="smallest fill worth booking; anything smaller waits whole (default: 0.01, 0 disables it)",
+    )
+    parser.add_argument(
+        "--borrow-rate", type=float, default=0.0, metavar="RATE",
+        help="annual cost of holding shorts, as a fraction (default: 0)",
+    )
     parser.add_argument("--json", action="store_true", help="print JSON instead of the summary")
     parser.add_argument(
         "-g", "--chart", "--graph", action="store_true",

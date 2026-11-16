@@ -208,7 +208,7 @@ print(result["metrics"])
 print(result["trades"][-1])
 ```
 
-`end_date` defaults to the latest session on disk. Pass `include_dividends=False` to skip cash distributions. Three optional knobs model friction: `spread_pct` (one-way spread paid on every fill), `max_participation` (largest share of a bar's volume one fill may take, the rest waits for the next open), and `borrow_rate` plus `hard_to_borrow` (annual cost of holding shorts, and tickers that can't be shorted at all). All default to zero friction, so leave them out and the run behaves exactly as before.
+`end_date` defaults to the latest session on disk. Pass `include_dividends=False` to skip cash distributions. Four optional knobs model friction: `spread_pct` (one-way spread paid on every fill), `max_participation` (largest share of a bar's volume one fill may take, the rest waits for the next open), `min_fill_notional` (smallest fill worth booking, in dollars; anything smaller waits whole for the next open instead of opening a dust lot — default `0.01`, `0.0` disables it), and `borrow_rate` plus `hard_to_borrow` (annual cost of holding shorts, and tickers that can't be shorted at all). All default to zero friction, so leave them out and the run behaves exactly as before.
 
 The result is a dict with `metrics`, the `equity` curve records, the full `trades` list, `rejections` (refused orders by reason), and a `stamp` recording the strategy, dates, and costs behind the run.
 
@@ -295,6 +295,10 @@ sltp reset               restore all settings to their defaults
 | `-s, --start DATE` | first session, `YYYY-MM-DD` (default: 3 years before the end) |
 | `-e, --end DATE` | last session, `YYYY-MM-DD` (default: the latest session on disk) |
 | `--no-dividends` | ignore cash distributions |
+| `--spread-bps BPS` | one-way spread paid on every fill, in basis points (default: 0) |
+| `--max-participation FRAC` | largest share of a bar's volume one fill may take, 0-1 (default: no cap) |
+| `--min-fill DOLLARS` | smallest fill worth booking; smaller waits whole (default: 0.01, 0 disables) |
+| `--borrow-rate RATE` | annual cost of holding shorts, as a fraction (default: 0) |
 | `--json` | print JSON instead of the summary |
 | `-g, --chart` | draw an SVG equity chart and open it |
 | `-o, --out FILE` | write everything (hook breakdown, report, chart) to `FILE`; the terminal stays quiet (implies `--chart`) |

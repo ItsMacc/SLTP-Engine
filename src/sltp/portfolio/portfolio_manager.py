@@ -48,6 +48,10 @@ class PortfolioManager:
         # One-way spread cost per fill, and the largest share of a bar one fill may take.
         self.SPREAD_PCT: float = 0.0
         self.MAX_PARTICIPATION: float | None = None
+        # Smallest fill worth booking, in dollars of notional. Anything smaller
+        # waits whole for the next open instead of opening a dust lot. 0.0
+        # disables the floor.
+        self.MIN_FILL_NOTIONAL: float = 0.01
         # Annual borrow rate on open shorts, plus tickers that cannot be shorted at all.
         self.BORROW_RATE: float = 0.0
         self.HARD_TO_BORROW: frozenset[str] = frozenset()
@@ -341,6 +345,13 @@ class PortfolioManager:
         # downsizes to the cash instead of dying on a hairline shortfall.
         allocation: float = self._affordable_allocation(resolved, equity_at_entry)
 
+        # Affordability drove it to zero or below (cash within float dust of
+        # zero, even slightly negative): wait for an exit to free cash and
+        # carry whole. An order that itself asked for zero or negative stays
+        # invalid and falls through to the rejection below.
+        if allocation <= 0.0 and resolved > 0.0:
+            return order
+
         if not self._validate_order_constraints(order, ticker, ticker_lots, allocation):
             return None
 
@@ -356,7 +367,16 @@ class PortfolioManager:
         # What the bar would not take, in equity fractions. A fill smaller than
         # a cent would print dust lots day after day, so the order waits whole.
         unfilled: float = allocation - fill_allocation
-        if unfilled * equity_at_entry >= 0.01 > fill_allocation * equity_at_entry:
+        if unfilled * equity_at_entry >= self.MIN_FILL_NOTIONAL > fill_allocation * equity_at_entry:
+            return order
+
+        # A fill under a cent is dust, not a position: carry the whole order
+        # instead of booking it. The guard above only waits when the leftover
+        # is meaningful; affordability can shrink the fill itself to dust with
+        # nothing left over, which is exactly the cash-exhausted case. A
+        # sub-cent fill cannot buy anything at cent-rounded prices, so tiny-
+        # but-complete orders wait too rather than opening dust lots.
+        if fill_allocation * equity_at_entry < self.MIN_FILL_NOTIONAL:
             return order
 
         # Slippage and spread both move against the position. Spread is the
@@ -427,9 +447,9 @@ class PortfolioManager:
         # Keep later fills in this batch on equity net of earlier entry fees
         self.portfolio_value -= entry_fee
 
-        # Carry what the bar would not take; a remainder under a cent is dust.
+        # Carry what the bar would not take; a remainder under the floor is dust.
         # Fixed-cash orders carry dollars, the rest carry equity fractions.
-        if unfilled * equity_at_entry >= 0.01:
+        if unfilled * equity_at_entry >= self.MIN_FILL_NOTIONAL:
             if order.sizing is OrderSizing.FIXED:
                 return replace(order, allocation=order.allocation - fill_allocation * equity_at_entry)
             return replace(order, allocation=order.allocation - fill_allocation)

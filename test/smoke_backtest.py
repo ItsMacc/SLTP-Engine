@@ -13,7 +13,7 @@ import resource
 import sys
 
 from sltp import Backtester, Strategy
-from sltp.data.market_data_service import bar_files, get_latest_trading_date
+from sltp.data.market_data_service import flat_files_for, get_latest_trading_date
 from sltp.utils import Order, PositionType
 
 
@@ -61,7 +61,7 @@ def peak_memory_mib() -> float:
 
 # -------- Entry Point --------
 def main() -> int:
-    files: list[str] = bar_files()
+    files: list[str] = flat_files_for(None, None)
     print(f"bar files: {len(files)}")
     for path in files:
         print(f"  {os.path.basename(path)} ({os.path.getsize(path) / 1e6:.0f} MB)")

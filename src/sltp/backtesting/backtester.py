@@ -140,19 +140,23 @@ class Backtester:
     # Wire up the manager and the per-run state.
     def __init__(self, strategy: Strategy, start_date: str, end_date: str | None = None, include_dividends: bool = True,
                  spread_pct: float = 0.0, max_participation: float | None = None,
-                 borrow_rate: float = 0.0, hard_to_borrow: list[str] | set[str] | tuple[str, ...] | None = None) -> None:
+                 borrow_rate: float = 0.0, hard_to_borrow: list[str] | set[str] | tuple[str, ...] | None = None,
+                 min_fill_notional: float = 0.01) -> None:
         if spread_pct < 0:
             raise ValueError(f"spread_pct must be non-negative, got {spread_pct}.")
         if max_participation is not None and max_participation <= 0:
             raise ValueError(f"max_participation must be positive, got {max_participation}.")
         if borrow_rate < 0:
             raise ValueError(f"borrow_rate must be non-negative, got {borrow_rate}.")
+        if min_fill_notional < 0:
+            raise ValueError(f"min_fill_notional must be non-negative, got {min_fill_notional}.")
         self.strategy: Strategy = strategy
         self.manager: PortfolioManager = PortfolioManager(strategy)
         self.manager.SPREAD_PCT = float(spread_pct)
         self.manager.MAX_PARTICIPATION = None if max_participation is None else float(max_participation)
         self.manager.BORROW_RATE = float(borrow_rate)
         self.manager.HARD_TO_BORROW = frozenset(hard_to_borrow) if hard_to_borrow else frozenset()
+        self.manager.MIN_FILL_NOTIONAL = float(min_fill_notional)
         self.manager.set_history_loader(self._history_for_trade)
         self.start_date: str = start_date
         self.end_date: str | None = end_date
@@ -372,6 +376,7 @@ class Backtester:
                 "slippage_pct": self.manager.SLIPPAGE_PCT,
                 "spread_pct": self.manager.SPREAD_PCT,
                 "max_participation": self.manager.MAX_PARTICIPATION,
+                "min_fill_notional": self.manager.MIN_FILL_NOTIONAL,
                 "borrow_rate": self.manager.BORROW_RATE,
                 "hard_to_borrow": sorted(self.manager.HARD_TO_BORROW),
                 "include_dividends": self.include_dividends,
