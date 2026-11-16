@@ -187,6 +187,13 @@ class Backtester:
         self._profile_remaining_days: int = 0
         self._profile_sampled_days: int = 0
         self._universe_warned: bool = False
+        # The sorted scan-ticker list behind _bars_on. Sorting up to ~11,500
+        # names every day is pure overhead: the bars dict is only ever looked
+        # up by ticker, never iterated in order. The cached order is reused
+        # until the membership actually changes (fills, rebalance), so the
+        # per-day order is exactly what sorted() always produced.
+        self._scan_tickers_cache: set[str] = set()
+        self._scan_tickers_sorted: list[str] = []
 
     # -------- Run --------
     # Simulate the strategy and return metrics, equity, trades, rejections and a stamp.
@@ -761,7 +768,11 @@ class Backtester:
     def _bars_on(self) -> dict[str, tuple[float, float, float, float]]:
         code = self._day_code
         bars: dict[str, tuple[float, float, float, float]] = {}
-        for ticker in sorted(self._scan_tickers()):
+        tickers = self._scan_tickers()
+        if tickers != self._scan_tickers_cache:
+            self._scan_tickers_cache = tickers
+            self._scan_tickers_sorted = sorted(tickers)
+        for ticker in self._scan_tickers_sorted:
             data = self._data.get(ticker)
             if data is None:
                 continue
@@ -841,6 +852,7 @@ class Backtester:
                 ordered.append(ticker)
 
         max_positions: int | None = self.strategy.MAX_POSITIONS
+        min_bars: int = self.strategy.MIN_BARS_REQUIRED
         for ticker in ordered:
             if ticker not in bars:
                 continue
@@ -851,8 +863,15 @@ class Backtester:
                 has_position_capacity: bool = max_positions is None or bool(held) or self.manager.active_positions < max_positions
                 if can_add_lot and has_position_capacity:
                     self._publish_series(ticker)
+                    # len(history.dates) is exactly index + 1, and the index is
+                    # already known: skip building the StockData view when the
+                    # outcome is certainly "too few bars". The len() check
+                    # below stays as the decider, so behavior cannot change.
+                    index = self._index_on_day(self._data.get(ticker))
+                    if index is not None and index + 1 < min_bars:
+                        continue
                     history = self._history_for_date(ticker)
-                    if len(history.dates) >= self.strategy.MIN_BARS_REQUIRED:
+                    if len(history.dates) >= min_bars:
                         if timed_day:
                             order = self._timed_hook("on_signal", self.strategy.on_signal, ticker, history)
                         else:
@@ -864,12 +883,17 @@ class Backtester:
 
     # Let the strategy close its own positions and queue an exit for the next open.
     def _process_custom_exits(self, current_date: str, bars: dict[str, tuple[float, float, float, float]], timed_day: bool) -> None:
+        min_bars: int = self.strategy.MIN_BARS_REQUIRED
         for ticker in self.manager.open_tickers:
             if ticker not in bars:
                 continue
             self._publish_series(ticker)
+            # Same skip-fast-path as entries: the len() check below stays.
+            index = self._index_on_day(self._data.get(ticker))
+            if index is not None and index + 1 < min_bars:
+                continue
             history = self._history_for_date(ticker)
-            if len(history.dates) < self.strategy.MIN_BARS_REQUIRED:
+            if len(history.dates) < min_bars:
                 continue
             for trade in self.manager.lots(ticker):
                 trade.history = history
