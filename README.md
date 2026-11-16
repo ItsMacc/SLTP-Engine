@@ -318,6 +318,6 @@ A strategy file is ordinary Python. Its folder goes on `sys.path`, so it can imp
 
 ## Links
 
-Website: https://your-website.com
+Website: https://sltp-app.com
 
-Docs: https://your-website.com/docs
+Docs: https://sltp-app.com/#/docs/introduction
