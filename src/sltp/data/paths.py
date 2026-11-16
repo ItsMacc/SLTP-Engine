@@ -2,7 +2,7 @@
 # Where the bar files live. The data is not shipped with the package, so lookup order:
 #   1. SLTP_DATA_DIR or `sltp data use`, naming the market directory or its parent.
 #   2. The managed R2 cache in ~/.sltp/cache, refreshed according to auto-update.
-# Bars live in one file per year (market_data_YYYY.parquet) plus the recent tail.
+# Bars live in one flat file per year (market_data_YYYY.bin) plus the recent tail.
 # The resolver returns a path even when the files are absent; the read layer raises.
 
 # -------- Imports --------
@@ -27,14 +27,23 @@ def _candidates() -> list[Path]:
     return roots
 
 
-# True when a path holds bars: at least one year chunk.
+# True when a path holds bars: at least one non-trivial flat bundle.
 def _has_data(root: Path) -> bool:
     if not root.is_dir():
         return False
-    return any(
-        path.name.startswith("market_data_") and path.suffix == ".parquet"
-        for path in root.glob("*.parquet")
-    )
+    for entry in root.iterdir():
+        if not (
+            entry.is_file()
+            and entry.name.startswith("market_data_")
+            and entry.name.endswith(".bin")
+        ):
+            continue
+        try:
+            if entry.stat().st_size > 24:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def has_bars(directory) -> bool:
@@ -56,16 +65,6 @@ def market_dir() -> Path:
 # True when reads resolve to the R2 cache, meaning the network may be used.
 def using_remote_cache() -> bool:
     return market_dir() == CACHE_MARKET_DIR
-
-
-# Where a run's bars come from, for status output and the run stamp.
-def source() -> dict:
-    chosen: Path = market_dir()
-    if chosen == CACHE_MARKET_DIR:
-        from sltp.data.remote import cached_version
-
-        return {"kind": "cache", "dir": str(chosen), "version": cached_version() or "unknown"}
-    return {"kind": "own", "dir": str(chosen), "version": "local"}
 
 
 # Where a run's bars come from, for status output and the run stamp.

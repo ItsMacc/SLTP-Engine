@@ -159,7 +159,7 @@ class Backtester:
         self.include_dividends: bool = include_dividends
         self.liquidate_on_end: bool = self.strategy.LIQUIDATE_ON_END
 
-        # Only the chunks overlapping this window are read, so a 2020 run skips the 1998 file.
+        # Only the bundles overlapping this window are read, so a 2020 run skips the 1998 file.
         self.load_start: str = self._load_start_for(self.start_date)
 
         # Ticker histories are loaded once and indexed once for the whole run

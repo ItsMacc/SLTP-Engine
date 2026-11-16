@@ -1,5 +1,5 @@
 # -------- check_range_loading.py --------
-# Prove that loading only the chunks a backtest touches is lossless.
+# Prove that loading only the bundles a backtest touches is lossless.
 #
 # Three claims are checked:
 #   1. A 2020 run selects only the year files its window touches.
@@ -20,12 +20,12 @@ import numpy as np
 import sltp.data.market_data_service as service
 
 from sltp import Backtester, Strategy
-from sltp.data.market_data_service import bar_files, bar_files_for
+from sltp.data.market_data_service import flat_files_for
 from sltp.utils import Order, PositionType
 
 
 # -------- Baseline --------
-# The buy-and-hold result recorded before the data was chunked, used as a regression
+# The buy-and-hold result recorded before range loading, used as a regression
 # marker: if range loading drops warm-up bars, this number moves.
 BASELINE_END_VALUE: float = 118.0106477949049
 BASELINE_TOLERANCE: float = 1e-9
@@ -120,7 +120,7 @@ def run(strategy: type, label: str) -> dict:
         end_date="2020-12-31",
     )
     # The engine's own window, so the count matches the files it really reads.
-    reading = len(service.bar_files_for(backtester.load_start, backtester.end_date))
+    reading = len(service.flat_files_for(backtester.load_start, backtester.end_date))
     started = time.time()
     result = backtester.run()
     elapsed = time.time() - started
@@ -131,10 +131,10 @@ def run(strategy: type, label: str) -> dict:
 
 # -------- Entry Point --------
 def main() -> int:
-    everything = bar_files()
-    window = bar_files_for("2015-01-02", "2020-12-31")
+    everything = flat_files_for(None, None)
+    window = flat_files_for("2015-01-02", "2020-12-31")
 
-    print(f"bar files on disk : {len(everything)}")
+    print(f"bundles on disk   : {len(everything)}")
     print(f"a 2020 run reads  : {len(window)}")
     for path in window:
         print(f"   {os.path.basename(path)}")
@@ -147,12 +147,12 @@ def main() -> int:
     buy_hold = run(BuyAndHold, "range-aware B&H")
 
     # The same run with pruning disabled: every file, every time.
-    original = service.bar_files_for
-    service.bar_files_for = lambda start=None, end=None: service.bar_files()
+    original = service.flat_files_for
+    service.flat_files_for = lambda start=None, end=None: everything
     try:
         full = run(TrendFilter, "full file set")
     finally:
-        service.bar_files_for = original
+        service.flat_files_for = original
 
     print()
     problems: list[str] = []
@@ -175,7 +175,7 @@ def main() -> int:
         if abs(end_value - BASELINE_END_VALUE) > BASELINE_TOLERANCE:
             problems.append(f"buy and hold moved off the baseline: {end_value!r}")
         else:
-            print(f"buy and hold ends at {end_value!r}, matching the pre-chunk baseline")
+            print(f"buy and hold ends at {end_value!r}, matching the baseline")
 
     if problems:
         print()

@@ -2,7 +2,7 @@
 # Run the whole engine once, against the real bar files.
 #
 # This is the check that the package is actually wired up: the path resolver found
-# the data, the Parquet reader loaded it, the indicator module stood in for TA-Lib,
+# the data, the bar reader loaded it, the indicator module stood in for TA-Lib,
 # the portfolio manager filled an order and the metrics came back.
 #
 #   python test/smoke_backtest.py

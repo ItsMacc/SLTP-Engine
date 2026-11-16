@@ -3,14 +3,15 @@
 # Universe lists keep delisted symbols too, so a backtest has no survivorship bias.
 
 # -------- Imports --------
-import bisect
 import contextlib
+import gzip
+import json
 import os
+import struct
 import re
 import threading
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from datetime import datetime
@@ -30,7 +31,6 @@ from sltp.data.paths import market_dir, symbol_data_dir, using_remote_cache
 # -------- Paths & Constants --------
 MARKET_DIR: str = str(market_dir())
 SYMBOL_DATA_DIR: str = str(symbol_data_dir())
-RECENT_FILE: str = os.path.join(MARKET_DIR, "market_data_recent.parquet")
 ACTIONS_FILE: str = os.path.join(MARKET_DIR, "market_actions.parquet")
 CATALOG_FILE: str = os.path.join(SYMBOL_DATA_DIR, "symbol_catalog.parquet")
 # Pre-merge filenames, kept only as a local fallback so existing checkouts keep working.
@@ -43,8 +43,6 @@ ACTION_DIVIDEND: int = 1
 MAX_DIVIDEND_PER_SHARE: float = 1_000_000.0
 DEFAULT_START: str = "1998-01-01"
 DATE_FORMAT: str = "%Y-%m-%d"
-PRICE_COLS: list[str] = ["Open", "High", "Low", "Close", "Volume"]
-BAR_COLS: list[str] = ["Symbol", "Date", *PRICE_COLS]
 SYMBOL_CACHE_LIMIT: int = 500
 # Largest request served through the shared cache. Bigger requests are read in one
 # pass straight to the caller: batching them would only re-scan the files per batch
@@ -65,38 +63,155 @@ _LOAD_LOCK = threading.RLock()  # without it, concurrent cold requests each load
 
 
 # -------- Bar Files --------
-# A chunk is one calendar year: market_data_<year>.parquet. Nothing else is read.
-CHUNK_PATTERN: re.Pattern = re.compile(r"^market_data_(\d{4})\.parquet$")
+# One flat bundle per year: MARKET_DAILY/market_data_<year>.bin. Nothing else is read.
+FLAT_YEAR_PATTERN: re.Pattern = re.compile(r"^market_data_(\d{4})\.bin$")
+FLAT_MAGIC: bytes = b"SLTPFLAT"
+# 1: raw column payload. 2: gzip-compressed column payload, header still raw.
+FLAT_FORMAT: int = 2
+FLAT_PREAMBLE: struct.Struct = struct.Struct("<8sIIQ")
+FLAT_RECENT_NAME: str = "market_data_recent.bin"
+FLAT_COLS: tuple = (
+    ("sym", np.dtype("<u2"), 2),
+    ("date", np.dtype("<u2"), 2),
+    ("open", np.dtype("<f4"), 4),
+    ("high", np.dtype("<f4"), 4),
+    ("low", np.dtype("<f4"), 4),
+    ("close", np.dtype("<f4"), 4),
+    ("vol", np.dtype("<f4"), 4),
+)
+FLAT_DTYPES: dict[str, np.dtype] = {name: dtype for name, dtype, _ in FLAT_COLS}
 
 
-# Every chunk on disk, oldest first. Empty when the bars still live in one file.
-def chunk_files() -> list[str]:
+# The header table of contents at the head of a container file. The one parser
+# for the format: the engine, the converter's manifest entries and `sltp data
+# check` all read through here. Anything foreign, truncated or ragged raises.
+def read_flat_header(bin_path: str) -> dict:
+    with open(bin_path, "rb") as handle:
+        preamble: bytes = handle.read(FLAT_PREAMBLE.size)
+        if len(preamble) != FLAT_PREAMBLE.size:
+            raise ValueError(f"{bin_path}: truncated preamble")
+        magic, fmt, header_len, rows = FLAT_PREAMBLE.unpack(preamble)
+        if magic != FLAT_MAGIC or fmt not in (1, FLAT_FORMAT):
+            raise ValueError(f"{bin_path}: not a flat container this engine wrote")
+        raw: bytes = handle.read(header_len)
+        if len(raw) != header_len:
+            raise ValueError(f"{bin_path}: truncated header")
+        index = json.loads(raw.decode("utf-8"))
+    counts = [int(c) for c in index.get("counts", [])]
+    runs_ok = sum(counts) == rows and (not counts or int(index.get("starts", [0])[0]) == 0)
+    if not runs_ok:
+        raise ValueError(f"{bin_path}: header runs do not cover all rows")
+    index["offsets"] = {name: int(at) for name, at in index.get("offsets", {}).items()}
+    index["rows"] = rows
+    index["header_len"] = header_len
+    index["format"] = fmt
+    return index
+
+
+# The column payload of one container: raw bytes for format 1, gunzipped for
+# format 2. Offsets in the index are payload-relative in both cases.
+def _flat_payload(bin_path: str, index: dict) -> bytes:
+    start: int = FLAT_PREAMBLE.size + int(index["header_len"])
+    with open(bin_path, "rb") as handle:
+        handle.seek(start)
+        blob: bytes = handle.read()
+    if index.get("format", 1) == 2:
+        blob = gzip.decompress(blob)
+    return blob
+
+
+# One full column as numpy, however the payload is stored. Views, never copies:
+# gunzip materializes the payload once, then every column is a view of it.
+def _flat_column(bin_path: str, index: dict, name: str) -> np.ndarray:
+    rows: int = int(index.get("rows", 0))
+    offset: int = int(index["offsets"][name])
+    dtype = FLAT_DTYPES[name]
+    if index.get("format", 1) == 2:
+        return np.frombuffer(_flat_payload(bin_path, index), dtype=dtype, count=rows, offset=offset)
+    base: int = FLAT_PREAMBLE.size + int(index["header_len"])
+    return np.fromfile(bin_path, dtype=dtype, count=rows, offset=base + offset)
+
+
+# Every flat bundle on disk, oldest first: (year, bin path, index). A bundle with a
+# foreign magic or format is ignored, never read. Parsed once per directory
+# signature; later calls reuse the cached list.
+_FLAT_BUNDLES_CACHE: list | None = None
+_FLAT_BUNDLES_SIG: tuple | None = None
+
+
+def _flat_bundles() -> list:
     if not os.path.isdir(MARKET_DIR):
         return []
-
-    chunks: list[tuple[int, str]] = []
+    global _FLAT_BUNDLES_CACHE, _FLAT_BUNDLES_SIG
+    try:
+        sig = tuple(
+            (name, os.path.getsize(os.path.join(MARKET_DIR, name)))
+            for name in os.listdir(MARKET_DIR)
+            if name.startswith("market_data_") and name.endswith(".bin")
+        )
+    except OSError:
+        return []
+    with _LOAD_LOCK:
+        if sig == _FLAT_BUNDLES_SIG and _FLAT_BUNDLES_CACHE is not None:
+            return _FLAT_BUNDLES_CACHE
+    found: list = []
     for name in os.listdir(MARKET_DIR):
-        match = CHUNK_PATTERN.match(name)
-        if match is None:
+        match = FLAT_YEAR_PATTERN.match(name)
+        if match is None and name != FLAT_RECENT_NAME:
             continue
-        path: str = os.path.join(MARKET_DIR, name)
-        if os.path.getsize(path) > 0:
-            chunks.append((int(match.group(1)), path))
-    chunks.sort()
-    return [path for _, path in chunks]
+        bin_path = os.path.join(MARKET_DIR, name)
+        if not os.path.isfile(bin_path):
+            continue
+        try:
+            index = read_flat_header(bin_path)
+        except (OSError, ValueError):
+            continue
+        year = int(match.group(1)) if match is not None else None
+        found.append((year, bin_path, index))
+    found.sort(key=lambda item: item[0] if item[0] is not None else 9999)
+    with _LOAD_LOCK:
+        _FLAT_BUNDLES_CACHE = found
+        _FLAT_BUNDLES_SIG = sig
+    return found
 
 
-# Pull the R2 chunks a range touches; a no-op whenever local bars exist, so the
+# Only the flat bundles a date range can touch. Reads the container headers
+# only: no column bytes move until the read itself.
+def flat_files_for(start: str | None, end: str | None) -> list[str]:
+    _ensure_remote_bars(start, end)
+    first_year: int | None = _year_of(start) if start is not None else None
+    last_year: int | None = _year_of(end) if end is not None else None
+    bundles = _flat_bundles()
+    years = [(year, path) for year, path, _ in bundles if year is not None]
+    recent = [path for year, path, _ in bundles if year is None]
+    if not years:
+        return recent
+    selected = [
+        path
+        for year, path in years
+        if (first_year is None or year >= first_year)
+        and (last_year is None or year <= last_year)
+    ]
+    if not selected:
+        return [path for _, path in years] + recent
+    newest: int = max(year for year, _ in years)
+    if last_year is None or last_year >= newest:
+        selected.extend(recent)
+    return selected
+
+
+# The flat bundles' signature for cache keys: (path, rows) per year.
+def _flat_signature() -> tuple:
+    return tuple((path, index["rows"]) for _, path, index in _flat_bundles())
+
+
+# Pull the R2 bundles a range touches; a no-op whenever local bars exist, so the
 # desktop path never pays for a check it does not need.
 def _ensure_remote_bars(start: str | None, end: str | None) -> None:
     if not using_remote_cache():
         return
     if _remote.offline():
-        try:
-            missing: bool = not _list_bar_files()
-        except RuntimeError:
-            missing = True
-        if missing:
+        if not _flat_bundles():
             raise RuntimeError(
                 "no bars cached and auto-update is off;"
                 " run `sltp data update` once or `sltp data auto on` to fetch them"
@@ -123,70 +238,9 @@ def _ensure_remote_actions() -> None:
     _remote.sync_actions()
 
 
-# Every file holding bars, oldest first: one chunk per year plus the recent tail.
-def bar_files() -> list[str]:
-    _ensure_remote_bars(None, None)
-    return _list_bar_files()
-
-
-# The bar files already on disk, without triggering any download.
-def _list_bar_files() -> list[str]:
-    files: list[str] = chunk_files()
-    if not files:
-        raise RuntimeError(
-            f"no bar files in {MARKET_DIR} (want market_data_YYYY.parquet);"
-            " run `sltp data update` or point at your own files with `sltp data use`"
-        )
-    if os.path.exists(RECENT_FILE) and os.path.getsize(RECENT_FILE) > 0:
-        files.append(RECENT_FILE)
-    return files
-
-
 # The year a YYYY-MM-DD bound falls in; callers validate the date before this.
 def _year_of(value: str) -> int:
     return int(str(value)[:4])
-
-
-# Only the files a date range can touch, so a 2020 run never opens the 1998-2003 file.
-# Results are unchanged: callers still slice to the range they asked for.
-def bar_files_for(start: str | None, end: str | None) -> list[str]:
-    _ensure_remote_bars(start, end)
-    files: list[str] = _list_bar_files()
-    if start is None and end is None:
-        return files
-
-    first_year: int | None = _year_of(start) if start is not None else None
-    last_year: int | None = _year_of(end) if end is not None else None
-
-    chunks: list[tuple[int, int, str]] = []
-    others: list[str] = []
-    for path in files:
-        match = CHUNK_PATTERN.match(os.path.basename(path))
-        if match is None:
-            others.append(path)
-            continue
-        year = int(match.group(1))
-        chunks.append((year, year, path))
-
-    # No year chunks (only the recent tail, say): nothing to prune by date.
-    if not chunks:
-        return files
-
-    selected: list[str] = [
-        path
-        for low, high, path in chunks
-        if (first_year is None or high >= first_year) and (last_year is None or low <= last_year)
-    ]
-
-    # A range outside the stored years reads everything, so the caller gets the usual error.
-    if not selected:
-        return files
-
-    # The tail is newer than every chunk, so it only belongs in a range that reaches it.
-    newest: int = max(high for _, high, _ in chunks)
-    if last_year is None or last_year >= newest:
-        selected.extend(others)
-    return selected
 
 
 # -------- Market Data --------
@@ -195,25 +249,27 @@ def get_latest_trading_date() -> str:
     return _cached_value("latest_date", _bars_signature(), _read_latest_date)
 
 
-# Every trading day as sorted int32 codes; a range reads only the chunks it touches.
+# Every trading day as sorted day codes; a range reads only the bundles it touches.
 def get_trading_calendar(start: str | None = None, end: str | None = None) -> np.ndarray:
     if start is None and end is None:
-        return _cached_value("trading_calendar", _bars_signature(), _read_trading_calendar)
+        return _cached_value(
+            "trading_calendar", _bars_signature(), lambda: _data_calendar()
+        )
 
-    files: list[str] = bar_files_for(start, end)
+    flats: list[str] = flat_files_for(start, end)
     key: str = f"trading_calendar:{start}:{end}"
 
     # Cut to the window while building, not after: the caller slices identically,
     # so the cached value holds only the sessions the run uses.
     def build() -> np.ndarray:
-        codes = _read_trading_calendar(files)
+        codes = _data_calendar(flats)
         if start is not None:
             codes = codes[codes >= to_code(start)]
         if end is not None:
             codes = codes[codes <= to_code(end)]
         return codes
 
-    return _cached_value(key, _files_signature(files), build)
+    return _cached_value(key, _flat_dir_signature(flats), build)
 
 
 # -------- Run Guard --------
@@ -415,14 +471,9 @@ def _signature(path: str, required: bool = True) -> tuple | None:
     return os.path.abspath(path), stat.st_size, stat.st_mtime_ns
 
 
-# The signature of a file set, so each date range gets its own cache entry.
-def _files_signature(files: list[str]) -> tuple:
-    return tuple(_signature(path) for path in files)
-
-
 # The signature of every bar file, so a write to any part of the set invalidates the caches.
 def _bars_signature() -> tuple:
-    return _files_signature(bar_files())
+    return _flat_signature()
 
 
 # The cached value for a key, rebuilt when its signature changed.
@@ -502,20 +553,24 @@ def _tickers_in_categories(kinds: tuple[str, ...]) -> list[str]:
 
 
 # -------- History Helpers --------
-# Histories for a request, reading only those symbols' row groups.
+# Histories for a request, slicing only those symbols' runs.
 def _selected_histories(symbols: list[str], start: str | None = None, end: str | None = None) -> dict[str, StockData]:
     global _SYMBOL_CACHE_SIGNATURE
     wanted: list[str] = list(dict.fromkeys(symbols))
-    files: list[str] = bar_files_for(start, end)
+    if not flat_files_for(start, end):
+        raise RuntimeError(
+            f"no bar files in {MARKET_DIR} (want market_data_YYYY.bin);"
+            " run `sltp data update` or point at your own files with `sltp data use`"
+        )
     with _LOAD_LOCK:
-        signature: tuple = _files_signature(files)
+        signature: tuple = _flat_signature()
         if signature != _SYMBOL_CACHE_SIGNATURE:
             _SYMBOL_CACHE.clear()
             _SYMBOL_CACHE_SIGNATURE = signature
 
         missing: list[str] = [symbol for symbol in wanted if symbol not in _SYMBOL_CACHE]
         if missing:
-            for symbol, history in _read_requested_histories(missing, files).items():
+            for symbol, history in _read_requested_histories(missing).items():
                 _SYMBOL_CACHE[symbol] = history
                 _SYMBOL_CACHE.move_to_end(symbol)
             while len(_SYMBOL_CACHE) > SYMBOL_CACHE_LIMIT:
@@ -533,14 +588,19 @@ BULK_CACHE_LIMIT: int = 2
 
 # A big request: one pass over the files, remembered for the next run that asks for it.
 def _bulk_histories(symbols: list[str], start: str, end: str | None) -> dict[str, StockData]:
-    files: list[str] = bar_files_for(start, end)
-    key: tuple = (_files_signature(files), start, end, len(symbols), hash(frozenset(symbols)))
+    key: tuple = (
+        _flat_signature(),
+        start,
+        end,
+        len(symbols),
+        hash(frozenset(symbols)),
+    )
     with _LOAD_LOCK:
         cached: dict[str, StockData] | None = _BULK_CACHE.get(key)
         if cached is not None:
             _BULK_CACHE.move_to_end(key)
             return cached
-        histories: dict[str, StockData] = _read_requested_histories(symbols, files, start, end)
+        histories: dict[str, StockData] = _read_requested_histories(symbols, start, end)
         _BULK_CACHE[key] = histories
         while len(_BULK_CACHE) > BULK_CACHE_LIMIT:
             _BULK_CACHE.popitem(last=False)
@@ -608,188 +668,141 @@ def _read_symbol_categories() -> dict[str, str]:
     return dict(zip(table.column("Symbol").to_pylist(), table.column(CATEGORY_COLUMN).to_pylist()))
 
 
-# Every symbol with bars; the dictionary encoding means one small read per row group.
+# Every symbol with bars, from the bundles' index symbol tables.
 def _read_tickers_with_bars() -> list[str]:
-    table = pq.read_table(bar_files(), columns=["Symbol"], read_dictionary=["Symbol"])
-    column = table.column("Symbol")
-    if isinstance(column, pa.ChunkedArray):
-        if pa.types.is_dictionary(column.type):
-            return sorted({label for chunk in column.chunks for label in chunk.dictionary.to_pylist()})
-        return column.unique().to_pylist()
-    if pa.types.is_dictionary(column.type):
-        return column.dictionary.to_pylist()
-    return column.unique().to_pylist()
+    names: set[str] = set()
+    for _, _, index in _flat_bundles():
+        names.update(str(symbol) for symbol in index["symbols"])
+    return sorted(names)
 
 
-# The newest Date in one file, taken from row-group statistics when they are there.
-def _newest_code_in(path: str) -> int | None:
-    metadata = pq.ParquetFile(path).metadata
-    if metadata.num_row_groups == 0:
-        return None
-    date_index = next(
-        (
-            index
-            for index in range(metadata.num_columns)
-            if metadata.row_group(0).column(index).path_in_schema == "Date"
-        ),
-        None,
-    )
-    if date_index is None:
-        return None
-
-    newest = None
-    for group in range(metadata.num_row_groups):
-        statistics = metadata.row_group(group).column(date_index).statistics
-        if statistics is None or statistics.max is None:
-            return None
-        value = int(statistics.max)
-        if newest is None or value > newest:
-            newest = value
-    return newest
-
-
-# The newest session across every bar file, falling back to reading the Date column.
+# The newest session across every bundle, from their index session ranges.
 def _read_latest_date() -> str:
     newest: int | None = None
-    for path in bar_files():
-        value: int | None = _newest_code_in(path)
-        if value is None:
-            newest = None
-            break
-        if newest is None or value > newest:
-            newest = value
+    for _, _, index in _flat_bundles():
+        code = int(to_code(str(index["last_session"])))
+        if newest is None or code > newest:
+            newest = code
     if newest is None:
-        newest = int(np.max(_codes_from_table(_read_table(["Date"]))))
+        newest = int(np.max(_data_calendar()))
     CALENDAR.register(labels_from_codes(np.array([newest], dtype=np.int32)))
     return CALENDAR.label(newest)
 
 
-# Read the requested columns; filters still skip row groups. Defaults to every bar file.
-def _read_table(columns: list[str], filters: list | None = None, files: list[str] | None = None) -> pa.Table:
-    return pq.read_table(files if files is not None else bar_files(), columns=columns, filters=filters)
+# The signature of one flat-bundle list, for cache keys.
+def _flat_dir_signature(paths: list[str]) -> tuple:
+    return tuple((path, os.path.getsize(path)) for path in paths if os.path.isfile(path))
 
 
-# The Date column as int32 day numbers.
-def _codes_from_table(table: pa.Table) -> np.ndarray:
-    column = table.column("Date")
-    if isinstance(column, pa.ChunkedArray):
-        column = column.combine_chunks()
-    return column.to_numpy(zero_copy_only=False)
-
-
-# Every trading day in the given files, as sorted int32 codes.
-def _read_trading_calendar(files: list[str] | None = None) -> np.ndarray:
-    codes: np.ndarray = np.unique(_codes_from_table(_read_table(["Date"], files=files)))
+# Union of trading sessions across the flat bundles in range.
+def _data_calendar(flat_dirs: list[str] | None = None) -> np.ndarray:
+    parts: list[np.ndarray] = []
+    if flat_dirs is None:
+        flat_dirs = flat_files_for(None, None)
+    if flat_dirs:
+        by_path: dict[str, dict] = {path: index for _, path, index in _flat_bundles()}
+        blocks: list[np.ndarray] = []
+        for path in flat_dirs:
+            index = by_path.get(path)
+            if index is None:
+                continue
+            try:
+                blocks.append(np.unique(_flat_column(path, index, "date")))
+            except (OSError, ValueError, KeyError):
+                continue
+        if blocks:
+            parts.append(np.unique(np.concatenate(blocks)))
+    codes = np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int32)
     CALENDAR.register(labels_from_codes(codes))
     return codes
 
 
-# Footer metadata per file, parsed once per file version. Only metadata is kept,
-# never an open handle, so a data refresh can still replace the files underneath.
-_FOOTERS: dict[str, tuple[tuple, object, list[tuple[str | None, str | None]] | None]] = {}
+# One flat year cut to the requested symbols and date range. Column bytes load
+# straight into numpy with no parsing, and each run is a view of them.
+# Unreadable or ragged bundles are skipped.
+def _flat_runs(
+    path: str,
+    index: dict,
+    wanted: list[str],
+    cut: bool,
+    low_code: int,
+    high_code: int,
+    pieces: dict[str, list[tuple[np.ndarray, ...]]],
+) -> None:
+    rows: int = int(index.get("rows", 0))
+    if rows <= 0:
+        return
+    cols: dict[str, np.ndarray] = {}
+    try:
+        for name, _, _ in FLAT_COLS:
+            cols[name] = _flat_column(path, index, name)
+    except (OSError, ValueError, KeyError):
+        return
+    if any(len(values) != rows for values in cols.values()):
+        return
+    CALENDAR.register(labels_from_codes(np.unique(cols["date"])))
+    symbols: list = index["symbols"]
+    starts: list = index["starts"]
+    counts: list = index["counts"]
+    position: dict[str, int] = {str(symbol): i for i, symbol in enumerate(symbols)}
+    date: np.ndarray = cols["date"]
+    bars: tuple[np.ndarray, ...] = (
+        cols["date"], cols["open"], cols["high"], cols["low"], cols["close"], cols["vol"]
+    )
+    for ticker in wanted:
+        at = position.get(ticker)
+        if at is None:
+            continue
+        head: int = int(starts[at])
+        tail: int = head + int(counts[at])
+        if cut:
+            lo, hi = _window_edges(date[head:tail], low_code, high_code)
+            if lo >= hi:
+                continue
+            head, tail = head + lo, head + hi
+        pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in bars))
 
 
-# The file's metadata plus each row group's (min, max) Symbol; None when any group lacks statistics.
-def _footer(path: str):
-    signature = _signature(path)
-    entry = _FOOTERS.get(path)
-    if entry is not None and entry[0] == signature:
-        return entry
-    metadata = pq.ParquetFile(path).metadata
-    bounds: list[tuple[str | None, str | None]] | None = []
-    if metadata.num_row_groups:
-        column = next(
-            i for i in range(metadata.num_columns)
-            if metadata.row_group(0).column(i).path_in_schema == "Symbol"
-        )
-        for group in range(metadata.num_row_groups):
-            stats = metadata.row_group(group).column(column).statistics
-            if stats is None or not stats.has_min_max:
-                bounds = None
-                break
-            bounds.append((stats.min, stats.max))
-    entry = (signature, metadata, bounds)
-    _FOOTERS[path] = entry
-    return entry
+# Flat bundles for the requested symbols, merged across years with _finalize so
+# a symbol split over years is stitched oldest-first through one finalize.
+def _read_flat_histories(
+    symbols: list[str],
+    paths: list[str],
+    start: str | None = None,
+    end: str | None = None,
+) -> dict[str, StockData]:
+    wanted: list[str] = sorted(set(symbols))
+    if not wanted or not paths:
+        return {}
+    cut: bool = start is not None or end is not None
+    low_code: int = int(to_code(start)) if start is not None else 0
+    high_code: int = int(to_code(end)) if end is not None else int(np.iinfo(np.int32).max)
+    by_path: dict[str, dict] = {}
+    for path in paths:
+        try:
+            by_path[path] = read_flat_header(path)
+        except (OSError, ValueError):
+            continue
+    pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
+    for path in sorted(by_path):
+        _flat_runs(path, by_path[path], wanted, cut, low_code, high_code, pieces)
+    return _finalize_histories(pieces)
 
 
-# Row groups of one file that can hold any wanted symbol. `wanted` is sorted.
-def _needed_groups(bounds, wanted: list[str]) -> list[int]:
-    if bounds is None:
-        return []
-    chosen: list[int] = []
-    for group, (low, high) in enumerate(bounds):
-        at = bisect.bisect_left(wanted, low)
-        if at < len(wanted) and wanted[at] <= high:
-            chosen.append(group)
-    return chosen
-
-
-# Only the requested symbols, reading just the row groups their Symbol ranges can touch.
+# Only the requested symbols, sliced straight out of the flat bundles.
 # With a start/end the bars are cut while the block is split, not in a second pass.
-# A big request streams each file whole (per-group overhead thousands of times would
-# dominate); a small request reads only matching groups, so cached histories stop
-# pinning whole decoded files and top-ups stop decoding them.
 def _read_requested_histories(
     symbols: list[str],
-    files: list[str] | None = None,
     start: str | None = None,
     end: str | None = None,
 ) -> dict[str, StockData]:
     wanted: list[str] = sorted(set(symbols))
     if not wanted:
         return {}
-    # A small request keeps copies so cached histories do not pin whole row groups.
-    copy: bool = len(wanted) <= SYMBOL_CACHE_LIMIT
-    file_list: list[str] = files if files is not None else bar_files()
-    if not copy:
-        filters = [("Symbol", "in", wanted)]
-        if start is not None:
-            filters.append(("Date", ">=", int(to_code(start))))
-        if end is not None:
-            filters.append(("Date", "<=", int(to_code(end))))
-
-        def whole_file_batches():
-            for path in file_list:
-                table = pq.read_table([path], columns=BAR_COLS, filters=filters)
-                yield from table.to_batches()
-                del table
-
-        return _build_histories(whole_file_batches(), 1, start, end, None, False)
-
-    pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
-    cut: bool = start is not None or end is not None
-    low_code: int = int(to_code(start)) if start is not None else 0
-    high_code: int = int(to_code(end)) if end is not None else int(np.iinfo(np.int32).max)
-    wanted_set: frozenset = frozenset(wanted)
-    for path in file_list:
-        _, metadata, bounds = _footer(path)
-        if bounds is None:  # no statistics: fall back to the dataset scan for this file
-            filters = [("Symbol", "in", wanted)]
-            if start is not None:
-                filters.append(("Date", ">=", int(to_code(start))))
-            if end is not None:
-                filters.append(("Date", "<=", int(to_code(end))))
-            table = pq.read_table([path], columns=BAR_COLS, filters=filters)
-            batches = table.to_batches()
-            del table
-        else:
-            groups: list[int] = _needed_groups(bounds, wanted)
-            if not groups:
-                continue
-            reader = pq.ParquetFile(path, metadata=metadata, read_dictionary=["Symbol"])
-            try:
-                table = reader.read_row_groups(groups, columns=BAR_COLS)
-            finally:
-                reader.close()
-            batches = table.to_batches()
-            del table
-        for batch in batches:
-            _accumulate_pieces(pieces, batch, cut, low_code, high_code, wanted_set, copy)
-    return _finalize_histories(pieces)
+    return _read_flat_histories(wanted, flat_files_for(start, end), start, end)
 
 
-# Every event of one kind grouped by symbol, so a dividend lookup is a dict hit, not a parquet read.
+# Every event of one kind grouped by symbol, so a dividend lookup is a dict hit, not a file scan.
 def _events_by_symbol(kind: int) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     _ensure_remote_actions()
     return _cached_value(f"actions_{kind}", _signature(ACTIONS_FILE, required=False), lambda: _read_events_by_symbol(kind))
@@ -834,14 +847,6 @@ def _window_edges(codes: np.ndarray, low_code: int, high_code: int) -> tuple[int
     return lo, hi
 
 
-# A column as numpy.
-def _column_values(column) -> np.ndarray:
-    try:
-        return column.to_numpy(zero_copy_only=True)
-    except pa.ArrowInvalid:
-        return column.to_numpy(zero_copy_only=False)
-
-
 # One ticker's bars put back together when a file left them in more than one piece.
 # Sorted by date, and a repeated date keeps the row from the later piece, as before.
 def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
@@ -876,46 +881,6 @@ def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
     )
 
 
-# One batch split into per-ticker pieces. `wanted` skips wide groups' extra
-# names; `copy` keeps small cached slices from pinning whole decoded groups.
-def _accumulate_pieces(
-    pieces: dict[str, list[tuple[np.ndarray, ...]]],
-    batch,
-    cut: bool,
-    low_code: int,
-    high_code: int,
-    wanted: frozenset | None = None,
-    copy: bool = False,
-) -> None:
-    encoded = pc.dictionary_encode(batch.column("Symbol"))
-    labels: list[str] = encoded.dictionary.to_pylist()
-    indices: np.ndarray = encoded.indices.to_numpy(zero_copy_only=True)
-    if indices.size == 0:
-        return  # a selected group that holds no wanted row
-    columns: tuple[np.ndarray, ...] = tuple(
-        _column_values(batch.column(name)) for name in ("Date", "Open", "High", "Low", "Close", "Volume")
-    )
-    date: np.ndarray = columns[0]
-    CALENDAR.register(labels_from_codes(np.unique(date)))
-
-    # Within one row group the file's own order holds, so equal symbols sit together.
-    edges: np.ndarray = np.flatnonzero(indices[1:] != indices[:-1]) + 1
-    starts = np.concatenate((np.zeros(1, dtype=np.int64), edges)).tolist()
-    ends = np.concatenate((edges, np.array([indices.size], dtype=np.int64))).tolist()
-    for head, tail in zip(starts, ends):
-        ticker: str = labels[indices[head]]
-        if wanted is not None and ticker not in wanted:
-            continue
-        if cut:
-            lo, hi = _window_edges(date[head:tail], low_code, high_code)
-            if lo >= hi:
-                continue
-            head, tail = head + lo, head + hi
-        if copy:
-            pieces.setdefault(ticker, []).append(tuple(column[head:tail].copy() for column in columns))
-        else:
-            pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in columns))
-
 
 # The pile into one StockData per symbol, freeing each ticker's pieces the moment
 # its merged arrays exist so the peak stays one shelf, not two.
@@ -931,29 +896,6 @@ def _finalize_histories(pieces: dict[str, list[tuple[np.ndarray, ...]]]) -> dict
                 continue
         histories[ticker] = _merge_runs(ticker, runs)
     return histories
-
-
-# Bars into one StockData per symbol, as views of the columns they were read from.
-# Given start/end each symbol is cut here, so callers get one pass over the bars.
-def _build_histories(
-    batches,
-    rows: int,
-    start: str | None = None,
-    end: str | None = None,
-    wanted: frozenset | None = None,
-    copy: bool = False,
-) -> dict[str, StockData]:
-    if rows == 0:
-        return {}
-
-    cut: bool = start is not None or end is not None
-    low_code: int = int(to_code(start)) if start is not None else 0
-    high_code: int = int(to_code(end)) if end is not None else int(np.iinfo(np.int32).max)
-
-    pieces: dict[str, list[tuple[np.ndarray, ...]]] = {}
-    for batch in batches:
-        _accumulate_pieces(pieces, batch, cut, low_code, high_code, wanted, copy)
-    return _finalize_histories(pieces)
 
 
 # The status file as symbol -> status.

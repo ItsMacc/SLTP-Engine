@@ -4,7 +4,7 @@
 #   from sltp import Strategy, Backtester, Order, PositionType
 #
 # sltp.data is deliberately not exported: a strategy asks the engine for bars, it does not
-# read Parquet itself. Set SLTP_DATA_DIR before importing when the bars live elsewhere.
+# read bar files itself. Set SLTP_DATA_DIR before importing when the bars live elsewhere.
 #
 # Nothing heavy is imported here. The names below resolve on first use, so importing
 # the package (which `import sltp.cli` always does) never waits on numpy or

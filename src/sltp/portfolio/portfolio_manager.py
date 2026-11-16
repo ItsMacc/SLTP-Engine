@@ -78,7 +78,7 @@ class PortfolioManager:
         self.rejected_orders: dict[str, int] = {}
         self._histories: dict[str, StockData] = {}
         # (ticker, date) -> history cut to that date, set by the backtester so fills
-        # in uncached tickers reuse the bulk read instead of querying Parquet mid-run.
+        # in uncached tickers reuse the bulk read instead of re-reading bar files mid-run.
         self._history_loader = None
         self._dividend_events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_dividend_code: int | None = None
@@ -144,7 +144,7 @@ class PortfolioManager:
     def lots(self, ticker: str) -> list[Trade]:
         return self._open_trades_by_ticker.get(ticker, []).copy()
 
-    # Use already-loaded histories instead of querying Parquet on fills.
+    # Use already-loaded histories instead of re-reading bar files on fills.
     def set_history_cache(self, histories: dict[str, StockData]) -> None:
         self._histories = histories
 

@@ -2,7 +2,7 @@
 
 SLTP is a backtesting engine for daily stock bars, built on plain NumPy. You describe a strategy in a small Python class, and SLTP walks it through years of history one session at a time, fills the orders, tracks the portfolio, and reports back with an equity curve, a trade list, and a full set of performance statistics.
 
-A few things define how it works. Strategies only ever see data up to the current bar, so lookahead bias is structurally impossible rather than something you have to police yourself. Splits and dividends are applied to positions automatically. Orders support allocation sizing, stop-losses, and take-profits. The portfolio manager enforces your position limits and records why any order was rejected. And because the hot path is vectorized NumPy over a local columnar archive, a multi-decade run over thousands of tickers completes in seconds on an ordinary laptop.
+A few things define how it works. Strategies only ever see data up to the current bar, so lookahead bias is structurally impossible rather than something you have to police yourself. Splits and dividends are applied to positions automatically. Orders support allocation sizing, stop-losses, and take-profits. The portfolio manager enforces your position limits and records why any order was rejected. And because the hot path is vectorized NumPy over a local flat-binary archive, a multi-decade run over thousands of tickers completes in seconds on an ordinary laptop.
 
 ## Installation
 
@@ -277,7 +277,7 @@ sltp data check ./my_bars # validate a folder before you trust it
 sltp reset                # forget every setting, behave like a fresh install
 ```
 
-Bringing your own bars: put one file per year named `market_data_YYYY.parquet` plus `market_actions.parquet` in a folder, with columns `Symbol, Date, Open, High, Low, Close, Volume` (dates as day numbers, rows sorted). Row-group size is our problem, not yours. Run `sltp data check` on the folder, then `sltp data use` it. No network, no surprises: with `auto off` the engine never phones home and runs on local files, warning when they go stale instead of failing.
+Bringing your own bars: put one flat bundle per year named `market_data_YYYY.bin` plus `market_actions.parquet` in a folder, then run `sltp data check` on it and `sltp data use` it. Build the bundles from yearly parquet (`Symbol, Date, Open, High, Low, Close, Volume` columns, rows sorted) with `python -m sltp.data.build_flat <parquet dir> <out dir>`. No network, no surprises: with `auto off` the engine never phones home and runs on local files, warning when they go stale instead of failing.
 
 ## CLI commands
 

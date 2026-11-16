@@ -528,13 +528,19 @@ def _command_compare(args) -> int:
 
 
 # -------- Data --------
-# How big a directory is, in MB, counting only parquet files.
-def _parquet_mb(directory: str) -> float:
+# How big a directory is, in MB, counting bar bundles plus catalog/actions.
+def _data_mb(directory: str) -> float:
     total: int = 0
     for name in os.listdir(directory):
+        full = os.path.join(directory, name)
         if name.endswith(".parquet"):
             try:
-                total += os.path.getsize(os.path.join(directory, name))
+                total += os.path.getsize(full)
+            except OSError:
+                pass
+        elif name.startswith("market_data_") and name.endswith(".bin"):
+            try:
+                total += os.path.getsize(full)
             except OSError:
                 pass
     return round(total / (1 << 20), 1)
@@ -564,14 +570,18 @@ def _command_data_status() -> int:
     else:
         print(f"version     local files (auto-update {'on' if auto else 'off'}; refresh only affects the cache)")
     try:
-        names = [name for name in os.listdir(directory) if name.endswith(".parquet")]
+        entries = os.listdir(directory)
     except OSError:
-        names = []
-    print(f"files       {len(names)} parquet files, {_parquet_mb(directory)} MB")
+        entries = []
+    bundles = sum(
+        1 for name in entries
+        if name.startswith("market_data_") and name.endswith(".bin")
+    )
+    print(f"files       {bundles} flat bundles, {_data_mb(directory)} MB")
     return 0
 
 
-# `sltp data update`: pull every chunk from R2, whatever auto says.
+# `sltp data update`: pull every bundle from R2, whatever auto says.
 def _command_data_update() -> int:
     from sltp.data import remote as _remote
 
@@ -584,10 +594,9 @@ def _command_data_update() -> int:
     return 0
 
 
-# `sltp data check`: every bar file must open with the columns the engine reads.
+# `sltp data check`: every flat bundle must carry the columns the engine reads,
+# with the byte sizes its header promises.
 def _command_data_check(path: str | None) -> int:
-    import pyarrow.parquet as pq
-
     from sltp.data.paths import has_bars, market_dir
 
     directory = os.path.abspath(os.path.expanduser(path)) if path else str(market_dir())
@@ -595,30 +604,52 @@ def _command_data_check(path: str | None) -> int:
         print(f"error: no such directory: {directory}", file=sys.stderr)
         return 1
     if not has_bars(directory):
-        print(f"error: {directory} holds no bar files (want market_data_YYYY.parquet)", file=sys.stderr)
+        print(f"error: {directory} holds no bar files (want market_data_* bundles)", file=sys.stderr)
         return 1
-    needed = {"Symbol", "Date", "Open", "High", "Low", "Close", "Volume"}
+    bundle_cols = (
+        ("sym", 2),
+        ("date", 2),
+        ("open", 4),
+        ("high", 4),
+        ("low", 4),
+        ("close", 4),
+        ("vol", 4),
+    )
     bad: int = 0
     for name in sorted(os.listdir(directory)):
-        if not (name.startswith("market_data_") and name.endswith(".parquet")):
+        if not name.startswith("market_data_"):
             continue
         full = os.path.join(directory, name)
-        try:
-            schema = pq.read_schema(full)
-            names = set(schema.names)
-            missing = sorted(needed - names)
-            rows = pq.ParquetFile(full).metadata.num_rows
-            status = "ok" if not missing and rows > 0 else "FAIL"
-            detail = f"{rows:,} rows"
-            if missing:
-                detail += f", missing columns: {', '.join(missing)}"
-            if rows == 0:
-                detail += ", empty file"
-        except Exception as error:
-            status, detail = "FAIL", f"unreadable ({error})"
-        if status == "FAIL":
-            bad += 1
-        print(f"  {status:<4} {name}  {detail}")
+        if name.endswith(".bin"):
+            try:
+                import gzip
+
+                from sltp.data.market_data_service import FLAT_PREAMBLE, read_flat_header
+
+                index = read_flat_header(full)
+                problems: list[str] = []
+                rows = int(index.get("rows", -1))
+                symbols, starts, counts = index.get("symbols", []), index.get("starts", []), index.get("counts", [])
+                if rows <= 0 or not (len(symbols) == len(starts) == len(counts)):
+                    problems.append("bad symbol table")
+                elif sum(int(c) for c in counts) != rows or int(starts[0]) != 0:
+                    problems.append("runs do not cover all rows")
+                want = sum(rows * width for _, width in bundle_cols)
+                size = os.path.getsize(full)
+                with open(full, "rb") as handle:
+                    handle.seek(FLAT_PREAMBLE.size + int(index["header_len"]))
+                    payload = handle.read()
+                if int(index.get("format", 1)) == 2:
+                    payload = gzip.decompress(payload)
+                if len(payload) != want:
+                    problems.append(f"payload is {len(payload)} bytes, want {want}")
+                status = "ok" if not problems else "FAIL"
+                detail = f"{rows:,} rows" + ("" if not problems else "; " + "; ".join(problems))
+            except Exception as error:
+                status, detail = "FAIL", f"unreadable ({error})"
+            if status == "FAIL":
+                bad += 1
+            print(f"  {status:<4} {name}  {detail}")
     print("all files valid" if bad == 0 else f"{bad} file(s) need attention")
     return 1 if bad else 0
 
@@ -646,7 +677,7 @@ def _command_data(args) -> int:
             print(f"error: no such directory: {directory}", file=sys.stderr)
             return 1
         if not has_bars(directory):
-            print(f"error: {directory} holds no bar files (want market_data_YYYY.parquet)", file=sys.stderr)
+            print(f"error: {directory} holds no bar files (want market_data_YYYY.bin)", file=sys.stderr)
             return 1
         _config.set_data_override(directory)
         print(f"reading bars from {directory}")

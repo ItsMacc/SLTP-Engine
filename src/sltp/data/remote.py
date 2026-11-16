@@ -1,5 +1,5 @@
 # -------- remote.py --------
-# Fetch market chunks from the public R2 bucket into a local cache.
+# Fetch market bundles from the public R2 bucket into a local cache.
 # No credentials, no new dependencies: plain HTTPS with urllib, reads with pyarrow.
 # The browser passes its own fetch (JS fetch bridge); the desktop uses the default.
 #
@@ -19,13 +19,16 @@ from pathlib import Path
 REMOTE_BASE_URL: str = "https://pub-8fe125f9d291408d9a41fa5228a663e2.r2.dev"
 # The bucket refuses the stock urllib user agent, so every request names us.
 USER_AGENT: str = "sltp"
-# Small file naming which chunks exist and what data version they belong to.
+# Small file naming which bundles exist and what data version they belong to.
 MANIFEST_KEY: str = "META/manifest.json"
 VERSION_KEY: str = "META/version.txt"
 # The two files a backtest always needs, whatever the date range.
 CATALOG_KEY: str = "SYMBOL_DATA/symbol_catalog.parquet"
 ACTIONS_KEY: str = "MARKET_DAILY/market_actions.parquet"
-# Where downloaded chunks live. Separate from ~/.sltp/data so cached R2 files
+# Bar bundles live as MARKET_DAILY/market_data_<year>.bin. The manifest lists
+# every file with its size and session range, so sync, prune and range overlap
+# treat bundle bytes as plain downloads.
+# Where downloaded bundles live. Separate from ~/.sltp/data so cached R2 files
 # never mix with a user's own bar files.
 CACHE_ROOT: Path = Path.home() / ".sltp" / "cache"
 CACHE_MARKET_DIR: Path = CACHE_ROOT / "MARKET_DAILY"
@@ -92,7 +95,7 @@ def _get_text(key: str, fetch=None) -> str:
         tmp.unlink(missing_ok=True)
 
 
-# The manifest: chunk names, byte sizes, row counts and session ranges.
+# The manifest: bundle names, byte sizes, row counts and session ranges.
 def read_manifest(fetch=None) -> dict:
     global _MANIFEST
     if _MANIFEST is None:
@@ -126,7 +129,7 @@ def cache_is_fresh(cache_root: Path = CACHE_ROOT, fetch=None) -> bool:
     return bool(remote) and cached_version(cache_root) == remote
 
 
-# Download one chunk with a single GET, skipping it when the local copy already
+# Download one bundle with a single GET, skipping it when the local copy already
 # matches the manifest size. A custom fetch (the browser's JS bridge) swaps in
 # through the same parameter; the desktop default uses urllib.
 def ensure_local(key: str, cache_root: Path = CACHE_ROOT, fetch=None, size: int | None = None) -> Path:
@@ -160,7 +163,8 @@ def _check_version(fetch=None, cache_root: Path = CACHE_ROOT) -> None:
     reset_manifest()
     manifest = read_manifest(fetch)
     wanted = {entry["key"] for entry in manifest["files"]}
-    for path in sorted(cache_root.rglob("*.parquet")):
+    stale = sorted(cache_root.rglob("*.bin")) + sorted(cache_root.rglob("*.index.json"))
+    for path in stale:
         if str(path.relative_to(cache_root)) not in wanted:
             path.unlink()
 
@@ -197,7 +201,7 @@ def sync_actions(fetch=None, cache_root: Path = CACHE_ROOT) -> Path:
     return dest
 
 
-# Only the MARKET_DAILY chunks a date range can touch. Open bounds mean the
+# Only the MARKET_DAILY bundles a date range can touch. Open bounds mean the
 # whole archive, which is what latest-date and full-universe queries need.
 def sync_bars(start: str | None, end: str | None, fetch=None, cache_root: Path = CACHE_ROOT) -> list[Path]:
     _check_version(fetch, cache_root)
@@ -220,7 +224,7 @@ def offline() -> bool:
     return not _REFRESHING and not _config.auto_update()
 
 
-# Refresh every chunk from R2 regardless of the auto-update choice: the user
+# Refresh every bundle from R2 regardless of the auto-update choice: the user
 # asked for it out loud. Returns the published version and what came down.
 def refresh_all(fetch=None, cache_root: Path = CACHE_ROOT) -> dict:
     global _VERSION_CHECKED, _REFRESHING
