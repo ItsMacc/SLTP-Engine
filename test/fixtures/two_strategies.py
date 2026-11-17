@@ -45,7 +45,6 @@ class Momentum(Strategy):
             ticker=ticker,
             position_type=PositionType.LONG,
             allocation=0.5,
-            order_date=str(data.dates[-1]),
             stop_loss=0.0,
             take_profit=0.0,
         )
@@ -77,7 +76,6 @@ class Value(Strategy):
             ticker=ticker,
             position_type=PositionType.LONG,
             allocation=self.WEIGHTS[self.TICKERS.index(ticker)],
-            order_date=str(data.dates[-1]),
             stop_loss=0.0,
             take_profit=0.0,
         )

@@ -131,7 +131,6 @@ def on_signal(self, ticker: str, data) -> Order | None:
         ticker=ticker,
         position_type=PositionType.LONG,
         allocation=0.5,
-        order_date=str(data.dates[-1]),
         stop_loss=0.0,
         take_profit=0.0,
     )
@@ -152,7 +151,6 @@ Order(
     ticker="SPY",
     position_type=PositionType.LONG,  # or PositionType.SHORT
     allocation=0.5,
-    order_date="2023-06-01",
     stop_loss=380.0,     # absolute price, 0.0 means none
     take_profit=460.0,   # absolute price, 0.0 means none
 )
@@ -171,21 +169,21 @@ from sltp import OrderSizing
 
 # Half the book, whatever the book is worth.
 Order(ticker="QQQ", position_type=PositionType.LONG, allocation=0.5,
-      order_date="2023-06-01", stop_loss=0.0, take_profit=0.0)
+      stop_loss=0.0, take_profit=0.0)
 
 # Exactly $10,000 of SPY.
 Order(ticker="SPY", position_type=PositionType.LONG, allocation=10_000,
-      order_date="2023-06-01", stop_loss=0.0, take_profit=0.0,
+      stop_loss=0.0, take_profit=0.0,
       sizing=OrderSizing.FIXED)
 
 # Everything left in cash, into TLT.
 Order(ticker="TLT", position_type=PositionType.LONG, allocation=1.0,
-      order_date="2023-06-01", stop_loss=0.0, take_profit=0.0,
+      stop_loss=0.0, take_profit=0.0,
       sizing=OrderSizing.AVAILABLE)
 
 # Half the book short QQQ.
 Order(ticker="QQQ", position_type=PositionType.SHORT, allocation=0.5,
-      order_date="2023-06-01", stop_loss=0.0, take_profit=0.0)
+      stop_loss=0.0, take_profit=0.0)
 ```
 
 `stop_loss` and `take_profit` are absolute prices, checked against the daily bars. `0.0` on either means no level there. Anything extra you want to remember (a signal score, a regime tag) rides along in `meta_data`, a plain dict the engine ignores.

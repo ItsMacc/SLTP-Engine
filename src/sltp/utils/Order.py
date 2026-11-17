@@ -3,6 +3,7 @@
 # The manager fills it at the next open, copies the risk levels onto the Trade, then drops it.
 # allocation is sized by `sizing`: EQUITY is a fraction of equity, FIXED is cash, AVAILABLE is
 # a fraction capped by uninvested cash. stop_loss and take_profit are absolute prices.
+# It carries no date: the manager stamps the fill with the bar it fills on.
 
 # -------- Imports --------
 from dataclasses import dataclass
@@ -24,7 +25,6 @@ class Order:
     ticker: str
     position_type: PositionType
     allocation: float
-    order_date: str
     stop_loss: float
     take_profit: float
     meta_data: dict | None = None

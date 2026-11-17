@@ -402,7 +402,6 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefi
                 ticker=ticker,
                 position_type=PositionType.LONG,
                 allocation=1.0,
-                order_date=str(data.dates[-1]),
                 stop_loss=0.0,
                 take_profit=0.0,
             )
