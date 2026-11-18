@@ -10,7 +10,7 @@ import numpy as np
 
 from dataclasses import dataclass
 
-from sltp.utils.Dates import CALENDAR, DateLabels, codes_from_labels
+from sltp.utils.Dates import DateLabels, codes_from_labels
 
 
 # -------- Stock Data --------
@@ -105,12 +105,6 @@ class StockData:
             labels = DateLabels(self.date_codes)
             self._views["dates"] = labels
         return labels
-
-    # The bar dates as a "<U10" array, for JSON and tabular output.
-    @property
-    def labels(self) -> np.ndarray:
-        return CALENDAR.label_array(self.date_codes)
-
 
     # One cached slice per name for the current window.
     def _view(self, name: str) -> np.ndarray:
