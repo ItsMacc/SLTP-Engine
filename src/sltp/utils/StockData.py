@@ -15,7 +15,10 @@ from sltp.utils.Dates import CALENDAR, DateLabels, codes_from_labels
 
 # -------- Stock Data --------
 # Read-only container for one ticker's bars and the window over them.
-@dataclass(frozen=True, init=False)
+# eq=False on purpose: the fields are numpy arrays, so the generated __eq__ compares
+# them elementwise and raises on bool(), and the generated __hash__ hashes an array.
+# These objects are compared by identity anyway -- there is only one per ticker.
+@dataclass(frozen=True, init=False, eq=False)
 class StockData:
     ticker: str
     _codes: np.ndarray
