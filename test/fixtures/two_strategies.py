@@ -1,10 +1,5 @@
 # -------- two_strategies.py --------
-# Two tiny strategies that exercise the CLI: one that trades on a trend filter and
-# one that holds a fixed mix. They are fast, need no tuning and use only the public
-# imports a user is meant to rely on.
-#
-#   sltp backtest test/fixtures/two_strategies.py:Momentum
-#   sltp compare test/fixtures/two_strategies.py:Momentum test/fixtures/two_strategies.py:Value
+# Two tiny strategies that exercise the CLI: one that trades on a trend filter and one that holds a fixed mix.
 
 # -------- Imports --------
 import numpy as np
@@ -36,7 +31,7 @@ class Momentum(Strategy):
     def on_signal(self, ticker: str, data) -> Order | None:
         if ticker in self.open_tickers:
             return None
-        closes = data.close_price
+        closes = data.closes
         if len(closes) < self.LOOKBACK:
             return None
         if float(closes[-1]) <= float(np.mean(closes[-self.TREND:])):

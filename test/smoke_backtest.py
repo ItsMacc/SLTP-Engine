@@ -1,11 +1,5 @@
 # -------- smoke_backtest.py --------
-# Run the whole engine once, against the real bar files.
-#
-# This is the check that the package is actually wired up: the path resolver found
-# the data, the bar reader loaded it, the indicator module stood in for TA-Lib,
-# the portfolio manager filled an order and the metrics came back.
-#
-#   python test/smoke_backtest.py
+# Run the whole engine once, against the real bar files. python test/smoke_backtest.py.
 
 # -------- Imports --------
 import os
@@ -40,7 +34,7 @@ class BuyAndHold(Strategy):
     def on_signal(self, ticker: str, data) -> Order | None:
         if ticker in self.open_tickers:
             return None
-        if float(data.close_price[-1]) <= 0.0:
+        if float(data.closes[-1]) <= 0.0:
             return None
         return Order(
             ticker=ticker,

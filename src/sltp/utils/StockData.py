@@ -1,22 +1,129 @@
 # -------- StockData.py --------
-# One ticker's daily OHLCV history as parallel numpy arrays.
-# The engine slices them up to the current date, so the last element is "today" and there
-# is no lookahead. Dates are int32 day numbers, but .dates still returns "YYYY-MM-DD".
+# One ticker's daily OHLCV history, plus the window of it a strategy is allowed to see.
+# The arrays are frozen on construction and never change. Only the window moves, and it lives
+# in a two-item list because rebinding a frozen field raises while mutating a list does not.
+# A `data` handed to a callback is valid for that callback alone: keeping a reference across
+# days reads whatever window the engine has moved to since, which is a silent lookahead bug.
 
 # -------- Imports --------
 import numpy as np
 
 from dataclasses import dataclass
 
-# Engine imports
 from sltp.utils.Dates import CALENDAR, DateLabels, codes_from_labels
+
+
+# -------- Stock Data --------
+# Read-only container for one ticker's bars and the window over them.
+@dataclass(frozen=True, init=False)
+class StockData:
+    ticker: str
+    _codes: np.ndarray
+    _opens: np.ndarray
+    _highs: np.ndarray
+    _lows: np.ndarray
+    _closes: np.ndarray
+    _volumes: np.ndarray
+
+    # Store the full bars and make every array read-only.
+    def __init__(self, ticker: str, date_codes=None, opens=None, highs=None,
+                 lows=None, closes=None, volumes=None):
+        put = object.__setattr__
+        put(self, "ticker", ticker)
+        put(self, "_codes", _frozen(_coerce_codes(date_codes)))
+        put(self, "_opens", _frozen(opens))
+        put(self, "_highs", _frozen(highs))
+        put(self, "_lows", _frozen(lows))
+        put(self, "_closes", _frozen(closes))
+        put(self, "_volumes", _frozen(volumes))
+
+        # The whole history is visible until the engine narrows it.
+        put(self, "_window", [0, int(np.size(self._closes))])
+        put(self, "_views", {})
+
+    # -------- Window --------
+    # Show bars [start, end), the last of which is today.
+    def set_window(self, start: int, end: int) -> None:
+        length: int = int(np.size(self._closes))
+        if start < 0 or end < start or end > length:
+            raise ValueError(
+                f"bad window [{start}, {end}) for {self.ticker} with {length} bars"
+            )
+
+        self._window[0] = int(start)
+        self._window[1] = int(end)
+        self._views.clear()
+
+    # Where the window sits, for a rebalance snapshot. Two ints, never an object.
+    @property
+    def window(self) -> tuple[int, int]:
+        return self._window[0], self._window[1]
+
+    def __len__(self) -> int:
+        return self._window[1] - self._window[0]
+
+    # -------- Bar Views --------
+    @property
+    def date_codes(self) -> np.ndarray:
+        return self._view("codes")
+
+    @property
+    def opens(self) -> np.ndarray:
+        return self._view("opens")
+
+    @property
+    def highs(self) -> np.ndarray:
+        return self._view("highs")
+
+    @property
+    def lows(self) -> np.ndarray:
+        return self._view("lows")
+
+    @property
+    def closes(self) -> np.ndarray:
+        return self._view("closes")
+
+    @property
+    def volumes(self) -> np.ndarray:
+        return self._view("volumes")
+
+    # -------- Engine View --------
+    # The complete arrays, ignoring the window.
+    @property
+    def full(self) -> tuple[np.ndarray, ...]:
+        return self._codes, self._opens, self._highs, self._lows, self._closes, self._volumes
+
+    # -------- Date Views --------
+    # The bar dates as "YYYY-MM-DD" labels, so dates[-1] is today.
+    @property
+    def dates(self) -> DateLabels:
+        labels = self._views.get("dates")
+        if labels is None:
+            labels = DateLabels(self.date_codes)
+            self._views["dates"] = labels
+        return labels
+
+    # The bar dates as a "<U10" array, for JSON and tabular output.
+    @property
+    def labels(self) -> np.ndarray:
+        return CALENDAR.label_array(self.date_codes)
+
+
+    # One cached slice per name for the current window.
+    def _view(self, name: str) -> np.ndarray:
+        view = self._views.get(name)
+        if view is None:
+            start, end = self._window
+            view = getattr(self, "_" + name)[start:end]
+            self._views[name] = view
+        return view
 
 
 # -------- Helpers --------
 # Accept date codes, "YYYY-MM-DD" labels or datetimes and return int32 codes.
 def _coerce_codes(value) -> np.ndarray:
     if value is None:
-        raise TypeError("StockData requires date_codes (or legacy dates).")
+        raise TypeError("StockData requires date_codes.")
     if isinstance(value, DateLabels):
         return value._codes
     array = np.asarray(value)
@@ -29,83 +136,8 @@ def _coerce_codes(value) -> np.ndarray:
     raise TypeError(f"Cannot build dates from {array.dtype} values.")
 
 
-# Make an array read-only, unless it already is. Slicing a read-only history hands
-# back read-only views, so the flag is already False most of the time and setting it
-# again costs more than building the object around it.
+# Make an array read-only, unless it already is.
 def _frozen(value):
     if isinstance(value, np.ndarray) and value.flags.writeable:
         value.flags.writeable = False
     return value
-
-
-# -------- Stock Data --------
-# Read-only container for one ticker's bars.
-@dataclass(frozen=True, init=False)
-class StockData:
-    ticker: str
-    date_codes: np.ndarray
-    open_price: np.ndarray
-    high: np.ndarray
-    low: np.ndarray
-    close_price: np.ndarray
-    volume: np.ndarray
-
-    # Store the bars and make every array read-only.
-    # `dates` is the legacy keyword: old readers pass "YYYY-MM-DD" arrays and they
-    # are converted to codes here.
-    def __init__(
-        self,
-        ticker: str,
-        date_codes=None,
-        open_price=None,
-        high=None,
-        low=None,
-        close_price=None,
-        volume=None,
-        *,
-        dates=None,
-    ):
-        put = object.__setattr__
-        put(self, "ticker", ticker)
-        put(self, "date_codes", _frozen(_coerce_codes(date_codes if date_codes is not None else dates)))
-        put(self, "open_price", _frozen(open_price))
-        put(self, "high", _frozen(high))
-        put(self, "low", _frozen(low))
-        put(self, "close_price", _frozen(close_price))
-        put(self, "volume", _frozen(volume))
-
-    # The engine's own slices: the arrays are already int32 date codes from another
-    # StockData, so this skips the coercion above. The result is read-only, like any
-    # other history, because every array is frozen before it is stored.
-    @classmethod
-    def view(
-        cls,
-        ticker: str,
-        date_codes: np.ndarray,
-        open_price,
-        high,
-        low,
-        close_price,
-        volume,
-    ) -> "StockData":
-        instance: StockData = object.__new__(cls)
-        put = object.__setattr__
-        put(instance, "ticker", ticker)
-        put(instance, "date_codes", _frozen(date_codes))
-        put(instance, "open_price", _frozen(open_price))
-        put(instance, "high", _frozen(high))
-        put(instance, "low", _frozen(low))
-        put(instance, "close_price", _frozen(close_price))
-        put(instance, "volume", _frozen(volume))
-        return instance
-
-    # -------- Date views --------
-    # The bar dates as a sequence of "YYYY-MM-DD" strings.
-    @property
-    def dates(self) -> DateLabels:
-        return DateLabels(self.date_codes)
-
-    # The bar dates as a "<U10" array, for JSON and tabular output.
-    @property
-    def labels(self) -> np.ndarray:
-        return CALENDAR.label_array(self.date_codes)

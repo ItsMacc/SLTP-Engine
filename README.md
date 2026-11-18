@@ -105,7 +105,7 @@ def initialize_universe(self, current_date: str, histories: dict) -> bool:
     self.tickers.clear()
     for ticker in self.available_stocks:
         data = histories[ticker]
-        if float(data.close_price[-1]) > 5.0 and float(data.volume[-1]) > 1_000_000:
+        if float(data.closes[-1]) > 5.0 and float(data.volumes[-1]) > 1_000_000:
             self.add_ticker(ticker)
     return bool(self.tickers)
 ```
@@ -116,13 +116,13 @@ One performance note: declaring `histories` without a default tells the engine t
 
 ### Step 3: `on_signal`, the actual decision
 
-Once per ticker per bar, the engine calls `on_signal` with that ticker's point-in-time history. `data` carries parallel NumPy arrays where the last element is today: `open_price`, `high`, `low`, `close_price`, `volume`, plus `dates` (`"YYYY-MM-DD"` strings). Return an `Order` to open a position, or `None` to pass.
+Once per ticker per bar, the engine calls `on_signal` with that ticker's point-in-time history. `data` carries parallel NumPy arrays where the last element is today: `opens`, `highs`, `lows`, `closes`, `volumes`, plus `dates` (`"YYYY-MM-DD"` strings). `len(data)` is the number of bars visible so far. Return an `Order` to open a position, or `None` to pass.
 
 ```python
 def on_signal(self, ticker: str, data) -> Order | None:
     if ticker in self.open_tickers:
         return None
-    closes = data.close_price
+    closes = data.closes
     if len(closes) < 60:
         return None
     if float(closes[-1]) <= float(sum(closes[-20:]) / 20):
@@ -141,6 +141,17 @@ A few helpers round out the class. `on_rebalance` rebuilds the universe whenever
 You also get a full indicator shelf that runs on the point-in-time bars: `_sma`, `_ema`, `_dema`, `_tema`, `_rsi`, `_macd`, `_bollinger_bands`, `_atr`, `_adx`, `_stochastic`, `_stochastic_rsi`, `_williams_r`, `_cci`, `_roc`, `_momentum`, `_obv`, `_mfi`, `_ad`, `_trix`, and `_parabolic_sar`. So the 20-day check above can just be `self._sma(closes, 20)[-1]`.
 
 The five busiest indicators (`_ema`, `_rsi`, `_atr`, `_adx`, `_macd`) stream instead of recomputing: the engine carries one small recurrence state per ticker forward bar by bar, so each call costs O(1) instead of O(history). On indicator-heavy universes that runs roughly 25-35x faster with bit-identical values; everything else stays on the batch path. Set `STREAMING_INDICATORS = False` on your strategy to force the old path for every indicator.
+
+### How history is stored
+
+One `StockData` object exists per ticker for the whole run, not one per ticker per day. It holds that ticker's full loaded bars plus a window over them, and the engine moves the window instead of building a new object:
+
+- `data.closes` (and `opens`, `highs`, `lows`, `volumes`, `dates`) return the window only, so the last element is always today and there is no lookahead. `len(data)` is the number of bars visible so far. Each window's views are cached, so a strategy that reads only `closes` pays for one slice per day rather than six.
+- `data` is only valid for the callback it was passed to. Holding onto it and reading it on a later day reads that day's window, not the one you saw, which is a silent lookahead bug.
+- `set_window(start, end)` and `data.window` are engine-facing. A strategy never calls them: the engine cuts each ticker to today before `on_signal` and before `should_exit`.
+- `data.full` returns `(codes, opens, highs, lows, closes, volumes)`, the complete arrays ignoring the window. The engine uses it to scan dates and to cut a trade's snapshot; strategies should read the windowed arrays instead.
+
+Inside a run there is one store: `_store` maps ticker to its single `StockData`, and the portfolio manager reads that same dict, so bars are loaded once and referenced everywhere. The universe cache holds `(start, end)` spans per rebalance date instead of objects, so an as-of snapshot costs two integers. A trade still gets its own cut of the bars through its entry day, because its history must never move under it the way the shared window does.
 
 ### Step 4: orders, how you ask for a position
 

@@ -1,11 +1,5 @@
 # -------- web.py --------
-# The browser contract: one call in, one plain dict out.
-# Everything here composes engine pieces the CLI already uses. No engine code lives
-# here and no files are written: charts come back as strings, never as files.
-#
-#   from sltp.web import run
-#   payload = run(strategy, "2020-01-01", "2020-12-31")
-#   json.dumps(payload)  # always works
+# The browser contract: one call in, one plain dict out. Everything here composes engine pieces the CLI already uses.
 
 # -------- Imports --------
 from __future__ import annotations
@@ -37,8 +31,7 @@ def _enum_value(member) -> str:
     return str(getattr(member, "value", member))
 
 
-# One trade as plain data. The bars stay out: a trade already names its ticker,
-# and the full history would multiply the payload for no chartable gain.
+# One trade as plain data.
 def _trade_to_dict(trade) -> dict:
     exit = trade.exit
     return {
@@ -63,8 +56,7 @@ def _trade_to_dict(trade) -> dict:
     }
 
 
-# A run() result as JSON-safe data: stats without the duplicated equity curve,
-# the curve as date and value pairs, trades as dicts.
+# A run() result as JSON-safe data: stats without the duplicated curve, the curve as pairs, trades as dicts.
 def to_jsonable(result: dict) -> dict:
     metrics = result.get("metrics") or {}
     stats = {str(key): _plain(value) for key, value in metrics.items() if key != "equity"}
@@ -77,8 +69,7 @@ def to_jsonable(result: dict) -> dict:
 
 
 # -------- Chart --------
-# The benchmark a lone chart is drawn against, mirroring the CLI: one fund,
-# bought and held. A failed benchmark is skipped, never fatal.
+# The benchmark a lone chart is drawn against, mirroring the CLI: one fund, bought and held.
 def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
     from sltp.backtesting import Backtester
     from sltp.strategy import Strategy
@@ -100,7 +91,7 @@ def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
             return True
 
         def on_signal(self, ticker: str, data) -> Order | None:
-            if ticker in self.open_tickers or float(data.close_price[-1]) <= 0.0:
+            if ticker in self.open_tickers or float(data.closes[-1]) <= 0.0:
                 return None
             return Order(
                 ticker=ticker,
@@ -116,9 +107,7 @@ def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
         return []
 
 
-# The chart for a result, string only. A lone line gets the benchmark when the
-# range is known; without one there is nothing to compare against. No equity
-# means no chart, so an empty run returns None instead of raising.
+# The chart for a result, string only. No equity means no chart, so an empty run returns None instead of raising.
 def chart_svg(
     result: dict,
     start: str | None = None,

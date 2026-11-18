@@ -1,6 +1,5 @@
 # -------- market_data_service.py --------
 # Cached read layer over the bar files and market_actions.parquet.
-# Universe lists keep delisted symbols too, so a backtest has no survivorship bias.
 
 # -------- Imports --------
 import contextlib
@@ -44,9 +43,7 @@ MAX_DIVIDEND_PER_SHARE: float = 1_000_000.0
 DEFAULT_START: str = "1998-01-01"
 DATE_FORMAT: str = "%Y-%m-%d"
 SYMBOL_CACHE_LIMIT: int = 500
-# Largest request served through the shared cache. Bigger requests are read in one
-# pass straight to the caller: batching them would only re-scan the files per batch
-# and churn the cache that selective reads rely on, for identical final bytes.
+# Largest request served through the shared cache.
 
 Scope = Literal["all", "stocks", "missing"]
 
@@ -82,9 +79,7 @@ FLAT_COLS: tuple = (
 FLAT_DTYPES: dict[str, np.dtype] = {name: dtype for name, dtype, _ in FLAT_COLS}
 
 
-# The header table of contents at the head of a container file. The one parser
-# for the format: the engine, the converter's manifest entries and `sltp data
-# check` all read through here. Anything foreign, truncated or ragged raises.
+# The header table of contents at the head of a container file. Anything foreign, truncated or ragged raises.
 def read_flat_header(bin_path: str) -> dict:
     with open(bin_path, "rb") as handle:
         preamble: bytes = handle.read(FLAT_PREAMBLE.size)
@@ -108,8 +103,7 @@ def read_flat_header(bin_path: str) -> dict:
     return index
 
 
-# The column payload of one container: raw bytes for format 1, gunzipped for
-# format 2. Offsets in the index are payload-relative in both cases.
+# The column payload of one container: raw bytes for format 1, gunzipped for format 2.
 def _flat_payload(bin_path: str, index: dict) -> bytes:
     start: int = FLAT_PREAMBLE.size + int(index["header_len"])
     with open(bin_path, "rb") as handle:
@@ -120,8 +114,7 @@ def _flat_payload(bin_path: str, index: dict) -> bytes:
     return blob
 
 
-# One full column as numpy, however the payload is stored. Views, never copies:
-# gunzip materializes the payload once, then every column is a view of it.
+# One full column as numpy, however the payload is stored.
 def _flat_column(bin_path: str, index: dict, name: str) -> np.ndarray:
     rows: int = int(index.get("rows", 0))
     offset: int = int(index["offsets"][name])
@@ -132,9 +125,7 @@ def _flat_column(bin_path: str, index: dict, name: str) -> np.ndarray:
     return np.fromfile(bin_path, dtype=dtype, count=rows, offset=base + offset)
 
 
-# Every flat bundle on disk, oldest first: (year, bin path, index). A bundle with a
-# foreign magic or format is ignored, never read. Parsed once per directory
-# signature; later calls reuse the cached list.
+# Every flat bundle on disk, oldest first: (year, bin path, index).
 _FLAT_BUNDLES_CACHE: list | None = None
 _FLAT_BUNDLES_SIG: tuple | None = None
 
@@ -175,8 +166,7 @@ def _flat_bundles() -> list:
     return found
 
 
-# Only the flat bundles a date range can touch. Reads the container headers
-# only: no column bytes move until the read itself.
+# Only the flat bundles a date range can touch.
 def flat_files_for(start: str | None, end: str | None) -> list[str]:
     _ensure_remote_bars(start, end)
     first_year: int | None = _year_of(start) if start is not None else None
@@ -205,8 +195,7 @@ def _flat_signature() -> tuple:
     return tuple((path, index["rows"]) for _, path, index in _flat_bundles())
 
 
-# Pull the R2 bundles a range touches; a no-op whenever local bars exist, so the
-# desktop path never pays for a check it does not need.
+# Pull the R2 bundles this range touches; a no-op when local bars exist, so the desktop path pays no network check.
 def _ensure_remote_bars(start: str | None, end: str | None) -> None:
     if not using_remote_cache():
         return
@@ -259,8 +248,7 @@ def get_trading_calendar(start: str | None = None, end: str | None = None) -> np
     flats: list[str] = flat_files_for(start, end)
     key: str = f"trading_calendar:{start}:{end}"
 
-    # Cut to the window while building, not after: the caller slices identically,
-    # so the cached value holds only the sessions the run uses.
+    # Cut to the window while building: the caller slices the same way, so the cache holds only the sessions in use.
     def build() -> np.ndarray:
         codes = _data_calendar(flats)
         if start is not None:
@@ -273,10 +261,8 @@ def get_trading_calendar(start: str | None = None, end: str | None = None) -> np
 
 
 # -------- Run Guard --------
-# A backtest in flight: direct reads from strategy hooks would bypass the run
-# window (lookahead) and the bulk cache, so the public entries below refuse
-# while one is active. Engine internals call the underscored readers, which
-# stay open. Thread-local so concurrent runs guard independently.
+# A backtest in flight: direct reads from a strategy hook would bypass the run window
+# (lookahead) and the bulk cache, so the public entries below refuse while one is active.
 _RUN_STATE = threading.local()
 
 
@@ -334,13 +320,10 @@ def get_stock_histories(tickers: list[str], start: str | None = None, end: str |
 def _get_histories(tickers: list[str], start: str, end: str | None) -> dict[str, StockData]:
     symbols: list[str] = [ticker.strip().upper() for ticker in tickers]
 
-    # One read per request, whatever the size. A request bigger than the shared cache
-    # can never benefit from it, so it goes straight to the files in a single pass
-    # instead of cycling batches through a cache it would only evict.
+    # One read per request, whatever the size.
     unique: list[str] = list(dict.fromkeys(symbols))
     if len(unique) > SYMBOL_CACHE_LIMIT:
-        # The bulk read already cut every history to this range, so the request order is
-        # the only thing left to apply.
+        # The bulk read already cut every history to this range, so the request order is the only thing left to apply.
         histories: dict[str, StockData] = _bulk_histories(unique, start, end)
         return {symbol: histories[symbol] for symbol in symbols if symbol in histories}
 
@@ -486,8 +469,7 @@ def _cached_value(key: str, signature: tuple | None, build):
     return value
 
 
-# The merged symbol catalog, falling back to the pre-merge symbols.parquet on
-# checkouts that have not re-downloaded the data yet.
+# The merged symbol catalog, falling back to the pre-merge symbols.parquet on checkouts that have not re-downloaded.
 def _catalog_path() -> str:
     if os.path.exists(CATALOG_FILE):
         return CATALOG_FILE
@@ -497,9 +479,7 @@ def _catalog_path() -> str:
     return LEGACY_SYMBOLS_FILE
 
 
-# Whatever file holds the status columns: the merged catalog when it has them,
-# else the legacy symbol_status.parquet. None when neither exists, so callers
-# degrade to "no status info" instead of raising.
+# Whatever file holds the status columns: the merged catalog when it has them, else the legacy symbol_status.parquet.
 def _status_source() -> str | None:
     catalog: str = _catalog_path()
     if os.path.exists(catalog) and "Status" in pq.read_schema(catalog).names:
@@ -535,8 +515,6 @@ def _tradable_bars_by_symbol() -> dict[str, int]:
 
 
 # Symbols of the given categories that have bars, memoized per file change.
-# Strategies read this on every rebalance; without the cache each call re-reads
-# the catalog and re-sorts ~11k symbols.
 def _tickers_in_categories(kinds: tuple[str, ...]) -> list[str]:
     kinds = tuple(sorted(kinds))
 
@@ -579,9 +557,7 @@ def _selected_histories(symbols: list[str], start: str | None = None, end: str |
         return {symbol: _SYMBOL_CACHE[symbol] for symbol in wanted if symbol in _SYMBOL_CACHE}
 
 
-# The newest bulk read, kept so a compare or a parameter sweep does not re-read the
-# same bars for every run. The key carries the bar files' signature, the range and the
-# universe, so changed files or a different question miss rather than serve stale bars.
+# The newest bulk read, kept so a compare or a parameter sweep does not re-read the same bars for every run.
 _BULK_CACHE: OrderedDict[tuple, dict[str, StockData]] = OrderedDict()
 BULK_CACHE_LIMIT: int = 2
 
@@ -616,14 +592,14 @@ def _slice_history(history: StockData, start: str, end: str | None) -> StockData
         return None
     if lo == 0 and hi == len(codes):
         return history
-    return StockData.view(
-        history.ticker,
-        codes[lo:hi],
-        history.open_price[lo:hi],
-        history.high[lo:hi],
-        history.low[lo:hi],
-        history.close_price[lo:hi],
-        history.volume[lo:hi],
+    return StockData(
+        ticker=history.ticker,
+        date_codes=codes[lo:hi],
+        opens=history.opens[lo:hi],
+        highs=history.highs[lo:hi],
+        lows=history.lows[lo:hi],
+        closes=history.closes[lo:hi],
+        volumes=history.volumes[lo:hi],
     )
 
 
@@ -717,9 +693,7 @@ def _data_calendar(flat_dirs: list[str] | None = None) -> np.ndarray:
     return codes
 
 
-# One flat year cut to the requested symbols and date range. Column bytes load
-# straight into numpy with no parsing, and each run is a view of them.
-# Unreadable or ragged bundles are skipped.
+# One flat year cut to the requested symbols and date range. Unreadable or ragged bundles are skipped.
 def _flat_runs(
     path: str,
     index: dict,
@@ -763,8 +737,7 @@ def _flat_runs(
         pieces.setdefault(ticker, []).append(tuple(column[head:tail] for column in bars))
 
 
-# Flat bundles for the requested symbols, merged across years with _finalize so
-# a symbol split over years is stitched oldest-first through one finalize.
+# Flat bundles for the wanted symbols, merged across years so a symbol split by year boundaries is stitched in order.
 def _read_flat_histories(
     symbols: list[str],
     paths: list[str],
@@ -790,7 +763,6 @@ def _read_flat_histories(
 
 
 # Only the requested symbols, sliced straight out of the flat bundles.
-# With a start/end the bars are cut while the block is split, not in a second pass.
 def _read_requested_histories(
     symbols: list[str],
     start: str | None = None,
@@ -848,7 +820,6 @@ def _window_edges(codes: np.ndarray, low_code: int, high_code: int) -> tuple[int
 
 
 # One ticker's bars put back together when a file left them in more than one piece.
-# Sorted by date, and a repeated date keeps the row from the later piece, as before.
 def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
     codes: np.ndarray = np.concatenate([run[0] for run in runs])
     columns: list[np.ndarray] = [np.concatenate([run[index] for run in runs]) for index in range(1, 6)]
@@ -856,11 +827,11 @@ def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
         return StockData(
             ticker=ticker,
             date_codes=codes,
-            open_price=columns[0],
-            high=columns[1],
-            low=columns[2],
-            close_price=columns[3],
-            volume=columns[4],
+            opens=columns[0],
+            highs=columns[1],
+            lows=columns[2],
+            closes=columns[3],
+            volumes=columns[4],
         )
     order: np.ndarray = np.argsort(codes, kind="stable")
     codes = codes[order]
@@ -873,17 +844,15 @@ def _merge_runs(ticker: str, runs: list[tuple[np.ndarray, ...]]) -> StockData:
     return StockData(
         ticker=ticker,
         date_codes=codes[keep],
-        open_price=ordered[0],
-        high=ordered[1],
-        low=ordered[2],
-        close_price=ordered[3],
-        volume=ordered[4],
+        opens=ordered[0],
+        highs=ordered[1],
+        lows=ordered[2],
+        closes=ordered[3],
+        volumes=ordered[4],
     )
 
 
-
-# The pile into one StockData per symbol, freeing each ticker's pieces the moment
-# its merged arrays exist so the peak stays one shelf, not two.
+# Fold the pieces into one StockData per symbol, freeing each ticker's pieces as its arrays exist, so peak is one shelf.
 def _finalize_histories(pieces: dict[str, list[tuple[np.ndarray, ...]]]) -> dict[str, StockData]:
     histories: dict[str, StockData] = {}
     for ticker in list(pieces.keys()):
@@ -892,7 +861,15 @@ def _finalize_histories(pieces: dict[str, list[tuple[np.ndarray, ...]]]) -> dict
         if len(runs) == 1:
             codes: np.ndarray = runs[0][0]
             if codes.size < 2 or bool(np.all(codes[1:] > codes[:-1])):
-                histories[ticker] = StockData.view(ticker, *runs[0])
+                histories[ticker] = StockData(
+                    ticker=ticker,
+                    date_codes=runs[0][0],
+                    opens=runs[0][1],
+                    highs=runs[0][2],
+                    lows=runs[0][3],
+                    closes=runs[0][4],
+                    volumes=runs[0][5],
+                )
                 continue
         histories[ticker] = _merge_runs(ticker, runs)
     return histories

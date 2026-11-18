@@ -1,14 +1,5 @@
 # -------- check_range_loading.py --------
-# Prove that loading only the bundles a backtest touches is lossless.
-#
-# Three claims are checked:
-#   1. A 2020 run selects only the year files its window touches.
-#   2. A strategy that needs 200 bars of warm-up still trades, so the window the
-#      engine asks for is wide enough.
-#   3. The same strategy over the full file set produces byte-identical results,
-#      so pruning files changes nothing but the work done.
-#
-#   python test/check_range_loading.py
+# Prove that loading only the bundles a backtest touches is lossless. Three claims are checked: 1. 2. 3.
 
 # -------- Imports --------
 import os
@@ -25,8 +16,7 @@ from sltp.utils import Order, PositionType
 
 
 # -------- Baseline --------
-# The buy-and-hold result recorded before range loading, used as a regression
-# marker: if range loading drops warm-up bars, this number moves.
+# The buy-and-hold result recorded before range loading: if warm-up bars go missing, this number moves.
 BASELINE_END_VALUE: float = 118.0106477949049
 BASELINE_TOLERANCE: float = 1e-9
 
@@ -50,7 +40,7 @@ class BuyAndHold(Strategy):
         return True
 
     def on_signal(self, ticker: str, data) -> Order | None:
-        if ticker in self.open_tickers or float(data.close_price[-1]) <= 0.0:
+        if ticker in self.open_tickers or float(data.closes[-1]) <= 0.0:
             return None
         return Order(
             ticker=ticker,
@@ -86,7 +76,7 @@ class TrendFilter(Strategy):
         return True
 
     def _above(self, data) -> bool:
-        closes = data.close_price
+        closes = data.closes
         if len(closes) < self.WINDOW:
             return False
         return float(closes[-1]) > float(np.mean(closes[-self.WINDOW:]))

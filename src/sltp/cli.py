@@ -1,12 +1,5 @@
 # -------- cli.py --------
 # The `sltp` command: run a strategy file, print what it did, draw the curve.
-#
-#   sltp backtest momentum.py
-#   sltp backtest momentum.py --chart
-#   sltp compare value.py momentum.py --out compare.svg
-#
-# A strategy is any Python file with a Strategy subclass; the file's directory joins
-# sys.path so it can import its siblings. Output is a summary by default, JSON with --json.
 
 # -------- Imports --------
 from __future__ import annotations
@@ -22,9 +15,7 @@ import sys
 from datetime import datetime
 
 
-# The installed version without importing the package, so --version never waits
-# on numpy and pyarrow. Every other sltp import lives inside the
-# function that needs it; module level here stays cheap for --help too.
+# The installed version without importing the package, so --version never waits on numpy and pyarrow.
 def _version() -> str:
     try:
         from importlib.metadata import PackageNotFoundError, version as _dist_version
@@ -87,9 +78,7 @@ def _red(text: str) -> str:
     return _styled(text, "31")
 
 
-# Colour codes take no room on screen, so a column is measured and padded by the
-# characters a person can see; otherwise a green cell widens its column invisibly
-# and every uncoloured row in that column drifts away from it.
+# Colour codes take no screen room, so a column is measured in visible characters; otherwise coloured rows drift.
 _ESCAPE = re.compile(r"\033\[[0-9;]*m")
 
 
@@ -224,8 +213,7 @@ def _period(start: str | None, end: str | None) -> tuple[str, str]:
 
 
 # -------- Running --------
-# Friction flags to Backtester knobs. Spread arrives in basis points because
-# that is how traders quote it; the engine takes a fraction.
+# Friction flags to Backtester knobs.
 def _friction_kwargs(args) -> dict:
     return {
         "spread_pct": args.spread_bps / 10_000.0,
@@ -242,8 +230,7 @@ def _run(strategy: Strategy, start: str, end: str, dividends: bool, friction: di
     return Backtester(strategy, start, end, dividends, **friction).run()
 
 
-# The same run, but silent: nothing to the terminal. Returns the result plus
-# the hook breakdown as text, so `-o` can file everything instead of printing.
+# The same run, but silent: nothing to the terminal.
 def _run_quiet(strategy: Strategy, start: str, end: str, dividends: bool, friction: dict) -> tuple[dict, str]:
     from sltp.backtesting import Backtester
 
@@ -252,8 +239,6 @@ def _run_quiet(strategy: Strategy, start: str, end: str, dividends: bool, fricti
 
 
 # Pull the handful of numbers the summary shows out of a run.
-# Positions still open at the end have no exit, so they have no return to score: a
-# win rate over zero closed trades is not 0%, it is unknown, and the report says so.
 def _summary(result: dict) -> dict:
     equity: list[dict] = result.get("equity") or []
     trades = result.get("trades") or []
@@ -360,8 +345,7 @@ def _json_payload(named: list[tuple[str, dict]], start: str, end: str) -> str:
 
 
 # -------- Chart --------
-# A file name for the chart, when the user did not choose one: one strategy
-# keeps its own name, a comparison joins every name with _vs_.
+# A chart file name when the user gave none: one strategy keeps its name, a comparison joins them with _vs_.
 def _chart_path(args, named: list[tuple[str, dict]]) -> str:
     if args.out:
         return args.out
@@ -372,8 +356,6 @@ def _chart_path(args, named: list[tuple[str, dict]]) -> str:
 
 
 # Draw every run on one chart, adding the benchmark when there is only one line.
-# With -o, `prefix` (breakdown plus report) goes into the file ahead of the
-# SVG, and the terminal hears only where the file went.
 def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefix: str = "") -> str:
     from sltp.graphs import ChartSeries, equity_chart, write_chart
     from sltp.strategy import Strategy
@@ -396,7 +378,7 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefi
             return True
 
         def on_signal(self, ticker: str, data) -> Order | None:
-            if ticker in self.open_tickers or float(data.close_price[-1]) <= 0.0:
+            if ticker in self.open_tickers or float(data.closes[-1]) <= 0.0:
                 return None
             return Order(
                 ticker=ticker,
@@ -430,8 +412,7 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefi
     )
     path: str = _chart_path(args, named)
     if args.out:
-        # The file is the whole result: breakdown, report, then the chart.
-        # The terminal hears only where it went.
+        # The file is the whole result: breakdown, report, then the chart. The terminal hears only where it went.
         document: str = (prefix + "\n\n" if prefix else "") + svg + "\n"
         path = write_chart(path, document)
         print(f"results saved in '{path}' at {os.path.abspath(path)}")
@@ -605,8 +586,7 @@ def _command_data_update() -> int:
     return 0
 
 
-# `sltp data check`: every flat bundle must carry the columns the engine reads,
-# with the byte sizes its header promises.
+# `sltp data check`: every flat bundle must carry the columns the engine reads, with the byte sizes its header promises.
 def _command_data_check(path: str | None) -> int:
     from sltp.data.paths import has_bars, market_dir
 

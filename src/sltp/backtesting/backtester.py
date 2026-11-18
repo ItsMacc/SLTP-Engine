@@ -1,6 +1,5 @@
 # -------- backtester.py --------
 # Runs a strategy day by day and returns what happened.
-# Callbacks only ever see bars up to the current date, and orders fill at the next open.
 
 # -------- Imports --------
 import inspect
@@ -26,112 +25,18 @@ from sltp.data.market_data_service import get_dividends, get_trading_calendar, _
 
 # -------- Constants --------
 # How far past the requested start the universe may look for a date it can trade.
-# A start-date search budget, not a warmup: it bounds the forward probe for a
-# tradable date and has nothing to do with how much history a strategy reads.
 MAX_START_PROBE_DAYS: int = 1826
-# History loaded when a strategy declares no LOOKBACK_BARS of its own: five
-# years of sessions, enough for the hungriest indicator or ranking window.
+# No LOOKBACK_BARS? Load five years of sessions: enough for the hungriest indicator or ranking window.
 DEFAULT_LOOKBACK_DAYS: int = 1826
 # As-of universe snapshots kept per date; probe dates never repeat, so a few suffice.
 _ASOF_CACHE_LIMIT: int = 4
 # A cash distribution above the whole pre-dividend share price is a data artefact.
 MAX_DIVIDEND_YIELD: float = 1.0
-# Hook profiling: the first 16,589 calls of a hot hook are timed exactly (two
-# clock reads are cheap at that scale), the rest are timed on whole sampled
-# days only, so untimed days cost the inner loops nothing at all. The sampled
-# budget is the finite-population formula for +-1% (99% accuracy) at 99%
-# confidence: n = n0 / (1 + n0 / remaining) with
-#   n0 = z^2 * p(1-p) / E^2 = 2.576^2 * 0.25 / 0.01^2 = 16,589.
-# (No power of two needed: days are counted with plain modulo, not a bitmask.)
-# p = 1/2 is the worst case (maximum variance), so real timing data lands
-# inside +-1% with room to spare. The absolute count rises with N but never
-# exceeds 16,589; only the fraction falls (50% at N = 16.6k, 0.04% at 39M).
-# The day is the sampling unit, so at least 50 days are always sampled:
-# 16,589 calls can collapse into 3 days on a wide universe, and three days
-# cannot represent 28 years of market regimes. Only these hooks are sampled;
-# the rest fire rarely enough to time always.
+# Hook profiling: the first 16,589 calls are timed exactly, the rest on sampled days only, so untimed days cost nothing.
 PROFILE_EXACT_CALLS: int = 16_589
 PROFILE_SAMPLE_N0: float = 16589.0
 PROFILE_MIN_SAMPLE_DAYS: int = 50
 PROFILE_SAMPLED_HOOKS: frozenset = frozenset({"on_signal", "should_exit"})
-
-
-# -------- Stamp --------
-# What a run is made of, so results can be cached honestly and compared fairly:
-# package and data versions, the requested and actual range, the cost knobs and
-# the strategy's own knobs. Everything in it survives json.dumps.
-_MISSING = object()
-
-
-# The installed package version, or "unknown" when it cannot be determined.
-def _package_version() -> str:
-    try:
-        from importlib.metadata import version as _dist_version
-        return _dist_version("sltp")
-    except Exception:
-        return "unknown"
-
-
-# Where the run's bars came from: "own:<dir>" or "cache@<version>".
-def _data_source() -> str:
-    try:
-        from sltp.data.paths import source
-
-        info = source()
-        if info.get("kind") == "cache":
-            return f"cache@{info.get('version', 'unknown')}"
-        return f"own:{info.get('dir', '?')}"
-    except Exception:
-        return "unknown"
-
-    # The published data version, or "unknown" when the manifest was never read.
-    # Sync paths already parse it, so this costs nothing whenever data was fetched.
-def _data_version() -> str:
-    try:
-        from sltp.data.remote import read_manifest
-        return str(read_manifest().get("version", "unknown"))
-    except Exception:
-        return "unknown"
-
-
-# A value that survives json.dumps, or _MISSING when it cannot be represented.
-# Plain scalars pass through; enums unwrap to their value; lists stay lists.
-def _stamp_scalar(value):
-    value = getattr(value, "value", value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)) and all(
-        item is None or isinstance(item, (bool, int, float, str)) for item in value
-    ):
-        return list(value)
-    return _MISSING
-
-
-# The strategy's knobs: its constraints plus any public scalar the subclass set.
-# The universe itself stays out: it is rebuilt from code and data at run time.
-def _strategy_params(strategy) -> dict:
-    base: set[str] = set(vars(Strategy()))
-    custom: dict = {}
-    for key, value in vars(strategy).items():
-        if key in base or key.startswith("_"):
-            continue
-        scalar = _stamp_scalar(value)
-        if scalar is not _MISSING:
-            custom[key] = scalar
-    return {
-        "class": type(strategy).__name__,
-        "name": getattr(strategy, "name", None),
-        "constraints": {
-            "max_positions": _stamp_scalar(getattr(strategy, "MAX_POSITIONS", None)),
-            "max_allocation_per_ticker": _stamp_scalar(getattr(strategy, "MAX_ALLOCATION_PER_TICKER", None)),
-            "max_lots_per_ticker": _stamp_scalar(getattr(strategy, "MAX_LOTS_PER_TICKER", None)),
-            "rebalance_frequency": _stamp_scalar(getattr(strategy, "REBALANCE_FREQUENCY", None)),
-            "min_bars_required": _stamp_scalar(getattr(strategy, "MIN_BARS_REQUIRED", None)),
-            "lookback_bars": _stamp_scalar(getattr(strategy, "LOOKBACK_BARS", None)),
-            "liquidate_on_end": _stamp_scalar(getattr(strategy, "LIQUIDATE_ON_END", None)),
-        },
-        "custom": custom,
-    }
 
 
 # -------- Backtester --------
@@ -176,32 +81,28 @@ class Backtester:
         self._has_custom_exit: bool = getattr(strategy.should_exit, "__func__", None) is not Strategy.should_exit
         self._has_resting_exits: bool = False
         self._universe_tickers: set[str] = set()
-        self._asof_cache: dict[str, dict[str, StockData]] = {}
-        self._universe_histories: dict[str, StockData] = {}
+        # Every bar the run uses: one StockData per ticker, created once and reused.
+        self._store: dict[str, StockData] = {}
+        # Ranking windows per date: ticker -> (start, end). Spans, never objects.
+        self._asof_cache: dict[str, dict[str, tuple[int, int]]] = {}
         self._universe_skipped: set[str] = set()
         self._cut_cursors: dict[str, tuple[int, int, int]] = {}
         self._pending_rebalance: bool = False
         self._day_code = np.int32(0)
         self._hook_time: dict[str, float] = {}
         self._hook_calls: dict[str, int] = {}
-        # Profiling state: exact-prefix snapshots taken when the prefix ends,
-        # plus the day counts that scale sampled hooks (see _run).
+        # Profiling state: the exact-prefix snapshots, plus the day counts that scale sampled hooks.
         self._profile_prefix_time: dict[str, float] = {}
         self._profile_prefix_calls: dict[str, int] = {}
         self._profile_remaining_days: int = 0
         self._profile_sampled_days: int = 0
         self._universe_warned: bool = False
-        # The sorted scan-ticker list behind _bars_on. Sorting up to ~11,500
-        # names every day is pure overhead: the bars dict is only ever looked
-        # up by ticker, never iterated in order. The cached order is reused
-        # until the membership actually changes (fills, rebalance), so the
-        # per-day order is exactly what sorted() always produced.
+        # The sorted scan-ticker list behind _bars_on.
         self._scan_tickers_cache: set[str] = set()
         self._scan_tickers_sorted: list[str] = []
 
     # -------- Run --------
     # Simulate the strategy and return metrics, equity, trades, rejections and a stamp.
-    # Quiet skips the stderr breakdown; fetch it later with hook_breakdown_text().
     def run(self, quiet: bool = False) -> dict:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
@@ -209,130 +110,8 @@ class Backtester:
         with _run_guard():
             return self._run(quiet)
 
-    # The simulation itself, under the read guard so strategy hooks cannot reach
-    # past the run window through the data service.
-    def _run(self, quiet: bool = False) -> dict:
-        self.strategy._reset_indicator_state()
 
-        actual_start: str = self._initialize_universe()
-        self._ensure_universe()
-        calendar: list = self._build_calendar(actual_start)
-        if not calendar:
-            raise ValueError("No trading days available between the start date and the loaded data.")
-
-        # Profiling plan, decided once. The leading prefix_days are timed exactly
-        # (the first ~20,000 hot-hook calls, warmup included); later days are
-        # timed one in sample_every, spread evenly so history growth is covered
-        # uniformly. The decision is per day, so untimed days are pure engine.
-        tickers_per_day = max(1, len(self._scan_tickers()))
-        prefix_days = min(len(calendar), (PROFILE_EXACT_CALLS + tickers_per_day - 1) // tickers_per_day)
-        remaining_calls = (len(calendar) - prefix_days) * tickers_per_day
-        if remaining_calls:
-            sampled_calls = PROFILE_SAMPLE_N0 / (1.0 + PROFILE_SAMPLE_N0 / remaining_calls)
-            sample_every = max(1, round(remaining_calls / sampled_calls))
-            sample_every = min(sample_every, max(1, (len(calendar) - prefix_days) // PROFILE_MIN_SAMPLE_DAYS))
-        else:
-            sample_every = 1
-        self._profile_remaining_days = len(calendar) - prefix_days
-        self._profile_sampled_days = 0
-
-        self.manager.mark_rebalanced(CALENDAR.label(calendar[0]))
-        for day_index, code in enumerate(calendar):
-            self._day_code = code
-            current_date: str = CALENDAR.label(code)
-
-            # The day's timing decision, made once: everything below reads it.
-            timed_day = day_index < prefix_days or (day_index - prefix_days) % sample_every == 0
-            if day_index == prefix_days:
-                # The exact prefix ends here. What was measured so far stays as
-                # the warmup-inclusive baseline; sampled days scale on top.
-                self._profile_prefix_time = dict(self._hook_time)
-                self._profile_prefix_calls = dict(self._hook_calls)
-            if timed_day and day_index >= prefix_days:
-                self._profile_sampled_days += 1
-
-            # Strategy lifecycle callbacks come before order processing
-            self.manager.refresh_view()
-            self._timed_hook("run_daily", self.strategy.run_daily, current_date)
-
-            if self.manager.rebalance_due(current_date):
-                self._pending_rebalance = True
-
-            # A rebalance can change the active universe; cached tickers are cheap to revisit
-            self._ensure_universe()
-            bars = self._bars_on()
-            opens = {ticker: bar[0] for ticker, bar in bars.items()}
-            closes = {ticker: bar[3] for ticker, bar in bars.items()}
-
-            # Dividends belong to lots held from the previous close, before today's fills
-            self.manager.pay_dividends(int(self._day_code))
-
-            # Fill pending exits and entries at today's open
-            self.manager.fill_pending_exits(current_date, opens)
-            filled_tickers: set[str] = {order.ticker for order in self.manager.pending_orders}
-            self.manager.fill_pending_orders(current_date, opens)
-            for ticker in filled_tickers:
-                fill_index: int | None = self._index_on_day(self._data.get(ticker))
-                if fill_index is not None:
-                    for trade in self.manager.lots(ticker):
-                        if trade.entry_date == current_date:
-                            trade.history = self._history_as_of(ticker, fill_index)
-
-            # Evaluate entries against history through today's completed bar
-            self.manager.refresh_view()
-            if self._pending_rebalance:
-                self._call_universe_hook(self.strategy.on_rebalance, current_date)
-                self.manager.mark_rebalanced(current_date)
-                self._pending_rebalance = False
-                self._ensure_universe()
-                bars = self._bars_on()
-                opens = {ticker: bar[0] for ticker, bar in bars.items()}
-                closes = {ticker: bar[3] for ticker, bar in bars.items()}
-            self._process_tickers(current_date, bars, timed_day)
-
-            # Custom exits use today's completed data and queue next-open orders
-            if self._has_custom_exit and self.manager.open_trades:
-                self._process_custom_exits(current_date, bars, timed_day)
-
-            # Close-based protective exits use today's final OHLC
-            self._check_resting_exits(current_date, bars)
-
-            is_last_day: bool = day_index == len(calendar) - 1
-            if is_last_day:
-                self._unrealized_at_end = self._unrealized_pnl(closes)
-                if self.liquidate_on_end:
-                    self.manager.close_all(current_date, closes)
-
-            # Exactly one mark and one log per date, after all final-day fills
-            self.manager.update_daily_accounting(current_date, closes)
-            self._equity_records.append({
-                "date": current_date,
-                "portfolio_value": float(self.manager.portfolio_value),
-                "active_positions": self.manager.active_positions,
-                "total_transaction_cost": float(self.manager.total_cost),
-                "total_trading_cost": float(self.manager.total_trading_cost),
-                "total_borrow_cost": float(self.manager.total_borrow_cost),
-            })
-
-        self.manager.refresh_view()
-        if not quiet:
-            self._print_hook_breakdown()
-        metrics: dict = self.performance_metrics()
-        equity: list[dict] = self._equity_records
-        return {
-            "metrics": metrics,
-            "equity": equity,
-            "trades": self.manager.trades,
-            "rejections": dict(sorted(self.manager.rejected_orders.items())),
-            "stamp": self._stamp(),
-        }
-
-    # Where the run's Python time went, by strategy hook. To stderr so it never
-    # pollutes --json output; a slow strategy names itself here. The time column
-    # starts past the longest hook name, so every row lines up no matter which
-    # hooks a strategy defines.
-    # The breakdown as text, for callers (like `sltp -o`) that file it instead
-    # of printing it. Empty when nothing was timed.
+    # Where the run's Python time went, by strategy hook. Empty when nothing was timed.
     def hook_breakdown_text(self) -> str:
         if not self._hook_calls:
             return ""
@@ -344,8 +123,7 @@ class Backtester:
             calls: int = self._hook_calls[name]
             sampled = name in PROFILE_SAMPLED_HOOKS and self._profile_sampled_days > 0
             if sampled:
-                # Estimate the whole run from the exact prefix plus the sampled
-                # days. A '~' marks rows that are estimates, not measurements.
+                # Estimate the whole run from the exact prefix plus the sampled days.
                 scale = self._profile_remaining_days / self._profile_sampled_days
                 prefix_seconds = self._profile_prefix_time.get(name, 0.0)
                 prefix_calls = self._profile_prefix_calls.get(name, 0)
@@ -357,32 +135,6 @@ class Backtester:
             lines.append(f"  {name.ljust(width)}   {seconds:>7.2f}s x{calls:>7,}{mark}")
         return "\n".join(lines)
 
-    def _print_hook_breakdown(self) -> None:
-        text: str = self.hook_breakdown_text()
-        if text:
-            print(text, file=sys.stderr)
-
-    # What this run is made of: versions, range, costs and strategy knobs.
-    def _stamp(self) -> dict:
-        return {
-            "sltp_version": _package_version(),
-            "data_version": _data_version(),
-            "data_source": _data_source(),
-            "start": self.start_date,
-            "end": self.end_date,
-            "actual_start": self._equity_records[0]["date"] if self._equity_records else None,
-            "costs": {
-                "fee_rate": self.manager.FEE_RATE,
-                "slippage_pct": self.manager.SLIPPAGE_PCT,
-                "spread_pct": self.manager.SPREAD_PCT,
-                "max_participation": self.manager.MAX_PARTICIPATION,
-                "min_fill_notional": self.manager.MIN_FILL_NOTIONAL,
-                "borrow_rate": self.manager.BORROW_RATE,
-                "hard_to_borrow": sorted(self.manager.HARD_TO_BORROW),
-                "include_dividends": self.include_dividends,
-            },
-            "strategy": _strategy_params(self.strategy),
-        }
 
     # -------- Metrics --------
     # Turn the equity curve and closed trades into the reported statistics.
@@ -481,22 +233,153 @@ class Backtester:
             "equity": self._equity_records,
         }
 
-    # -------- Universe and Data --------
-    # The earliest bar a call on current_date may look back on. A strategy that
-    # declares LOOKBACK_BARS gets that many sessions, doubled so weekends and
-    # holidays never eat into it; anything else keeps the five-year default.
+    # -------- Helpers --------
+    # The simulation itself, under the read guard so no hook can reach past the run window through the data service.
+    def _run(self, quiet: bool = False) -> dict:
+        self.strategy._reset_indicator_state()
+
+        actual_start: str = self._initialize_universe()
+        self._ensure_universe()
+        calendar: list = self._build_calendar(actual_start)
+        if not calendar:
+            raise ValueError("No trading days available between the start date and the loaded data.")
+
+        # Profiling plan, decided once. The decision is per day, so untimed days are pure engine.
+        tickers_per_day = max(1, len(self._scan_tickers()))
+        prefix_days = min(len(calendar), (PROFILE_EXACT_CALLS + tickers_per_day - 1) // tickers_per_day)
+        remaining_calls = (len(calendar) - prefix_days) * tickers_per_day
+        if remaining_calls:
+            sampled_calls = PROFILE_SAMPLE_N0 / (1.0 + PROFILE_SAMPLE_N0 / remaining_calls)
+            sample_every = max(1, round(remaining_calls / sampled_calls))
+            sample_every = min(sample_every, max(1, (len(calendar) - prefix_days) // PROFILE_MIN_SAMPLE_DAYS))
+        else:
+            sample_every = 1
+        self._profile_remaining_days = len(calendar) - prefix_days
+        self._profile_sampled_days = 0
+
+        self.manager.mark_rebalanced(CALENDAR.label(calendar[0]))
+        for day_index, code in enumerate(calendar):
+            self._day_code = code
+            current_date: str = CALENDAR.label(code)
+
+            # The day's timing decision, made once: everything below reads it.
+            timed_day = day_index < prefix_days or (day_index - prefix_days) % sample_every == 0
+            if day_index == prefix_days:
+                # The exact prefix ends here.
+                self._profile_prefix_time = dict(self._hook_time)
+                self._profile_prefix_calls = dict(self._hook_calls)
+            if timed_day and day_index >= prefix_days:
+                self._profile_sampled_days += 1
+
+            # Strategy lifecycle callbacks come before order processing
+            self.manager.refresh_view()
+            self._timed_hook("run_daily", self.strategy.run_daily, current_date)
+
+            if self.manager.rebalance_due(current_date):
+                self._pending_rebalance = True
+
+            # A rebalance can change the active universe; cached tickers are cheap to revisit
+            self._ensure_universe()
+            bars = self._bars_on()
+            opens = {ticker: bar[0] for ticker, bar in bars.items()}
+            closes = {ticker: bar[3] for ticker, bar in bars.items()}
+
+            # Dividends belong to lots held from the previous close, before today's fills
+            self.manager.pay_dividends(int(self._day_code))
+
+            # Fill pending exits and entries at today's open
+            self.manager.fill_pending_exits(current_date, opens)
+            self.manager.fill_pending_orders(current_date, opens)
+
+            # Evaluate entries against history through today's completed bar
+            self.manager.refresh_view()
+            if self._pending_rebalance:
+                self._call_universe_hook(self.strategy.on_rebalance, current_date)
+                self.manager.mark_rebalanced(current_date)
+                self._pending_rebalance = False
+                self._ensure_universe()
+                bars = self._bars_on()
+                opens = {ticker: bar[0] for ticker, bar in bars.items()}
+                closes = {ticker: bar[3] for ticker, bar in bars.items()}
+            self._process_tickers(current_date, bars, timed_day)
+
+            # Custom exits use today's completed data and queue next-open orders
+            if self._has_custom_exit and self.manager.open_trades:
+                self._process_custom_exits(current_date, bars, timed_day)
+
+            # Close-based protective exits use today's final OHLC
+            self._check_resting_exits(current_date, bars)
+
+            is_last_day: bool = day_index == len(calendar) - 1
+            if is_last_day:
+                self._unrealized_at_end = self._unrealized_pnl(closes)
+                if self.liquidate_on_end:
+                    self.manager.close_all(current_date, closes)
+
+            # Exactly one mark and one log per date, after all final-day fills
+            self.manager.update_daily_accounting(current_date, closes)
+            self._equity_records.append({
+                "date": current_date,
+                "portfolio_value": float(self.manager.portfolio_value),
+                "active_positions": self.manager.active_positions,
+                "total_transaction_cost": float(self.manager.total_cost),
+                "total_trading_cost": float(self.manager.total_trading_cost),
+                "total_borrow_cost": float(self.manager.total_borrow_cost),
+            })
+
+        self.manager.refresh_view()
+        if not quiet:
+            self._print_hook_breakdown()
+        metrics: dict = self.performance_metrics()
+        equity: list[dict] = self._equity_records
+        return {
+            "metrics": metrics,
+            "equity": equity,
+            "trades": self.manager.trades,
+            "rejections": dict(sorted(self.manager.rejected_orders.items())),
+            "stamp": self._stamp(),
+        }
+
+    def _print_hook_breakdown(self) -> None:
+        text: str = self.hook_breakdown_text()
+        if text:
+            print(text, file=sys.stderr)
+
+    # What this run is made of: versions, range, costs and strategy knobs.
+    def _stamp(self) -> dict:
+        return {
+            "sltp_version": _package_version(),
+            "data_version": _data_version(),
+            "data_source": _data_source(),
+            "start": self.start_date,
+            "end": self.end_date,
+            "actual_start": self._equity_records[0]["date"] if self._equity_records else None,
+            "costs": {
+                "fee_rate": self.manager.FEE_RATE,
+                "slippage_pct": self.manager.SLIPPAGE_PCT,
+                "spread_pct": self.manager.SPREAD_PCT,
+                "max_participation": self.manager.MAX_PARTICIPATION,
+                "min_fill_notional": self.manager.MIN_FILL_NOTIONAL,
+                "borrow_rate": self.manager.BORROW_RATE,
+                "hard_to_borrow": sorted(self.manager.HARD_TO_BORROW),
+                "include_dividends": self.include_dividends,
+            },
+            "strategy": _strategy_params(self.strategy),
+        }
+
+    # The earliest bar a call on current_date may look back on.
     def _load_start_for(self, current_date: str) -> str:
         lookback: int | None = self.strategy.LOOKBACK_BARS
         days: int = DEFAULT_LOOKBACK_DAYS if lookback is None else max(0, lookback * 2)
         return (datetime.strptime(current_date, "%Y-%m-%d") - relativedelta(days=days)).strftime("%Y-%m-%d")
+
     # Build the universe, walking the start date forward until the strategy accepts it.
     def _initialize_universe(self) -> str:
         start_dt: datetime = datetime.strptime(self.start_date, "%Y-%m-%d")
         if self._universe_at(start_dt, 0):
             return self._accepted_universe_date(start_dt, 0)
 
-        # The earliest success and the tickers it built, so the winning probe
-        # never has to run (and reload) a second time.
+        # The earliest success and the tickers it built, so the winning probe never runs (and reloads) a second time.
         best: tuple[int, list[str]] | None = None
         low: int = 0
         high: int = 1
@@ -540,8 +423,7 @@ class Backtester:
             raise ValueError("initialize_universe() returned True but declared no tickers.")
         return (start_dt + relativedelta(days=offset)).strftime("%Y-%m-%d")
 
-    # Time one strategy hook call for the end-of-run breakdown. Hot hooks reach
-    # this on timed days only (see the profiling plan in _run).
+    # Time one strategy hook call for the end-of-run breakdown.
     def _timed_hook(self, name: str, hook, *args):
         start: float = time.perf_counter()
         try:
@@ -551,8 +433,6 @@ class Backtester:
             self._hook_calls[name] = self._hook_calls.get(name, 0) + 1
 
     # Call a universe hook, passing as-of histories when the strategy asks for them.
-    # A histories parameter defaulting to None promises the hook ignores it,
-    # so the full-universe load is skipped entirely.
     def _call_universe_hook(self, hook, current_date: str):
         parameters = list(inspect.signature(hook).parameters.values())
         accepts_histories: bool = len(parameters) >= 2 or any(
@@ -566,51 +446,50 @@ class Backtester:
         return self._timed_hook(hook.__name__, hook, current_date)
 
     # Every ticker's bars up to the callback date, for universe ranking.
-    # One entry per date asked, so a repeated probe is a dict hit, not a reload.
     def _histories_as_of(self, current_date: str) -> dict[str, StockData]:
-        cached: dict[str, StockData] | None = self._asof_cache.get(current_date)
-        if cached is not None:
-            return dict(cached)
+        spans: dict[str, tuple[int, int]] | None = self._asof_cache.get(current_date)
+        if spans is None:
+            # A warm-up probe can reach past the run's end: that rare date gets its own load and is not cached.
+            if self.end_date is not None and current_date > self.end_date:
+                return self._load_histories(current_date)
+            spans = self._cut_spans(current_date)
+            self._asof_cache[current_date] = spans
+            while len(self._asof_cache) > _ASOF_CACHE_LIMIT:
+                self._asof_cache.pop(next(iter(self._asof_cache)))
 
+        # The store's objects are shared; the window is what makes a snapshot. Everyone gets the
+        # same objects the next caller will see, so a hook must not hold on to them.
         histories: dict[str, StockData] = {}
-        # A warm-up probe can look past the run's own end date, and the bulk read
-        # stops there; that rare date keeps the old one-shot load.
-        if self.end_date is not None and current_date > self.end_date:
-            histories = self._load_histories(current_date)
-        else:
-            histories = self._cut_histories(current_date)
+        for ticker, (lo, hi) in spans.items():
+            history = self._store[ticker]
+            history.set_window(lo, hi)
+            histories[ticker] = history
+        return histories
 
-        self._asof_cache[current_date] = histories
-        while len(self._asof_cache) > _ASOF_CACHE_LIMIT:
-            self._asof_cache.pop(next(iter(self._asof_cache)))
-        return dict(histories)
-
-    # Read the universe for one date straight from the files. Only the runaway
-    # warm-up probe uses this; every normal ranking date is cut from the bulk read.
+    # Read the universe for one date straight from the files.
     def _load_histories(self, current_date: str) -> dict[str, StockData]:
         code = to_code(current_date)
         histories: dict[str, StockData] = {}
         # Ranking only reads back from today, so the files after today cannot contribute.
         window_start: str = self._load_start_for(current_date)
         for ticker, history in _get_histories(self.strategy.available_universe, window_start, current_date).items():
-            index: int = int(np.searchsorted(history.date_codes, code, side="right")) - 1
+            index: int = int(np.searchsorted(history.full[0], code, side="right")) - 1
             if index >= 0:
-                histories[ticker] = self._slice_history(history, index)
+                history.set_window(0, index + 1)
+                histories[ticker] = history
         return histories
 
-    # Warn once when a large universe is mostly unusable: names with fewer bars
-    # than MIN_BARS_REQUIRED can never rank, so the user sees where the bulk
-    # read went instead of wondering why a full-universe strategy is slow.
+    # Warn once when most of a large universe is unusable: names short of MIN_BARS_REQUIRED can never rank.
     def _warn_once_for_unusable_symbols(self) -> None:
-        if self._universe_warned or len(self._universe_histories) < 1000:
+        if self._universe_warned or len(self._store) < 1000:
             return
         self._universe_warned = True
         min_bars: int = int(getattr(self.strategy, "MIN_BARS_REQUIRED", 0) or 0)
         if min_bars <= 0:
             return
-        short: int = sum(1 for history in self._universe_histories.values() if len(history.date_codes) < min_bars)
+        short: int = sum(1 for history in self._store.values() if history.full[0].size < min_bars)
         if short:
-            total: int = len(self._universe_histories)
+            total: int = len(self._store)
             print(
                 f"note: {total} symbols loaded for ranking; {short} have fewer than "
                 f"{min_bars} bars and can never meet MIN_BARS_REQUIRED.",
@@ -618,11 +497,10 @@ class Backtester:
             )
 
     # Load the whole ranking universe once, over the run's window.
-    # Tickers with no bars anywhere in it are remembered so they are not re-read.
-    def _ensure_universe_histories(self, symbols: list[str]) -> None:
+    def _ensure_ranked(self, symbols: list[str]) -> None:
         missing: list[str] = [
             symbol for symbol in dict.fromkeys(symbols)
-            if symbol not in self._universe_histories and symbol not in self._universe_skipped
+            if symbol not in self._store and symbol not in self._universe_skipped
         ]
         if not missing:
             return
@@ -632,39 +510,36 @@ class Backtester:
             if history is None:
                 self._universe_skipped.add(symbol)
             else:
-                self._universe_histories[symbol] = history
+                self._store[symbol] = history
         self._warn_once_for_unusable_symbols()
 
-    # One history for a trade opened in a ticker the handed-over cache never saw,
-    # cut from the same bulk window so a fill never triggers a side read.
+    # One history for a ticker the cache never saw, cut from the same bulk window so a fill reads no files.
     def _history_for_trade(self, ticker: str, current_date: str) -> StockData | None:
-        self._ensure_universe_histories([ticker])
-        history: StockData | None = self._universe_histories.get(ticker)
+        self._ensure_ranked([ticker])
+        history: StockData | None = self._store.get(ticker)
         if history is None:
             return None
-        index: int = int(np.searchsorted(history.date_codes, to_code(current_date), side="right")) - 1
+        index: int = int(np.searchsorted(history.full[0], to_code(current_date), side="right")) - 1
         if index < 0:
             return None
-        return self._slice_history(history, index)
+        return history
 
-    # Cut every ticker's bars to this date's ranking window. The cuts are views of
-    # the arrays already in memory, so a rebalance costs slicing, not reading files.
-    def _cut_histories(self, current_date: str) -> dict[str, StockData]:
+    # Cut every ticker's bars to this date's ranking window.
+    def _cut_spans(self, current_date: str) -> dict[str, tuple[int, int]]:
         code = to_code(current_date)
         low_code = to_code(self._load_start_for(current_date))
         symbols: list[str] = self.strategy.available_universe
-        self._ensure_universe_histories(symbols)
+        self._ensure_ranked(symbols)
 
         cursors: dict[str, tuple[int, int, int]] = self._cut_cursors
-        histories: dict[str, StockData] = {}
+        spans: dict[str, tuple[int, int]] = {}
         for ticker in symbols:
-            history: StockData | None = self._universe_histories.get(ticker)
+            history: StockData | None = self._store.get(ticker)
             if history is None:
                 continue
-            codes = history.date_codes
+            codes = history.full[0]
             cursor: tuple[int, int, int] | None = cursors.get(ticker)
-            # Bars only ever arrive at the end, so a name that did not trade since the
-            # last rebalance keeps its cut and needs no binary search at all.
+            # Bars only arrive at the end, so a name unchanged since the last rebalance keeps its cut, no search.
             if (
                 cursor is not None
                 and code >= cursor[2]
@@ -674,16 +549,14 @@ class Backtester:
                 lo, hi = cursor[0], cursor[1]
             else:
                 lo = int(np.searchsorted(codes, low_code, side="left"))
-                # Searching the tail for the far edge finds the second bound without
-                # a second walk over the whole history.
+                # Searching the tail for the far edge finds the second bound without walking the whole history twice.
                 hi = lo + int(np.searchsorted(codes[lo:], code, side="right"))
                 cursors[ticker] = (lo, hi, code)
-            # A ticker with no bar inside this window is absent, exactly as a
-            # single-date read would have left it out.
+            # A ticker with no bar inside this window is absent, exactly as a single-date read would have left it out.
             if lo >= hi:
                 continue
-            histories[ticker] = self._slice_range(history, lo, hi)
-        return histories
+            spans[ticker] = (lo, hi)
+        return spans
 
     # Make sure every ticker the strategy currently wants is loaded.
     def _ensure_universe(self) -> None:
@@ -693,13 +566,14 @@ class Backtester:
 
     # Load the given tickers, remembering the ones with no local data.
     def _ensure_tickers(self, tickers: list[str]) -> None:
+        # Missing day state, not missing bars, is the "not loaded" test: ranking may already have filled the store.
         missing: list[str] = [ticker for ticker in tickers if ticker not in self._data and ticker not in self.skipped]
         if not missing:
             return
 
-        # Anything the ranking universe already loaded (same window) is reused, not re-read.
+        # Anything the ranking universe already loaded is reused, never re-read.
         loaded: dict[str, StockData] = {
-            ticker: self._universe_histories[ticker] for ticker in missing if ticker in self._universe_histories
+            ticker: self._store[ticker] for ticker in missing if ticker in self._store
         }
         unread: list[str] = [
             ticker for ticker in missing if ticker not in loaded and ticker not in self._universe_skipped
@@ -711,14 +585,10 @@ class Backtester:
             if history is None:
                 self.skipped.add(ticker)
                 continue
+            self._store[ticker] = history
+            # Per-ticker run state: the arrays the day scan walks and the indicator series.
             self._data[ticker] = {
-                "history": history,
-                "codes": history.date_codes,
-                "open": history.open_price,
-                "high": history.high,
-                "low": history.low,
-                "close": history.close_price,
-                "volume": history.volume,
+                "arrays": history.full,
                 "series": _series_by_address(history),
                 "cursor": 0,
                 "index": None,
@@ -726,16 +596,16 @@ class Backtester:
             }
         if self.include_dividends:
             self._load_dividends(missing)
-        self.manager.set_history_cache({ticker: data["history"] for ticker, data in self._data.items()})
+        self.manager.set_history_cache(self._store)
 
     # Load dividends for the tickers just added, dropping impossible rows.
     def _load_dividends(self, tickers: list[str]) -> None:
         for ticker in tickers:
-            data = self._data.get(ticker)
-            if data is None or ticker in self._dividend_events:
+            history: StockData | None = self._store.get(ticker)
+            if history is None or ticker in self._dividend_events:
                 continue
             codes, amounts = get_dividends(ticker, self.load_start, self.end_date)
-            codes, amounts = self._plausible_dividends(data["history"], codes, amounts)
+            codes, amounts = self._plausible_dividends(history, codes, amounts)
             if codes.size:
                 self._dividend_events[ticker] = (codes, amounts)
         self.manager.set_dividend_events(self._dividend_events)
@@ -745,23 +615,23 @@ class Backtester:
     def _plausible_dividends(history: StockData, codes: np.ndarray, amounts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if codes.size == 0:
             return codes, amounts
-        index: np.ndarray = np.searchsorted(history.date_codes, codes, side="left") - 1
+        all_codes, _opens, _highs, _lows, all_closes, _volumes = history.full
+        index: np.ndarray = np.searchsorted(all_codes, codes, side="left") - 1
         valid: np.ndarray = index >= 0
         previous: np.ndarray = np.zeros(codes.size, dtype=np.float64)
-        previous[valid] = history.close_price[index[valid]]
+        previous[valid] = all_closes[index[valid]]
         keep: np.ndarray = valid & (previous > 0) & (amounts <= previous * MAX_DIVIDEND_YIELD)
         return codes[keep], amounts[keep]
 
     # The market's own trading days inside the run window.
     def _build_calendar(self, actual_start: str) -> list:
-        if not self._data:
+        if not self._store:
             raise ValueError("No price data loaded. initialize_universe() must add locally available tickers.")
         codes = get_trading_calendar(actual_start, self.end_date)
         start_code = to_code(actual_start)
         end_code = to_code(self.end_date) if self.end_date is not None else codes[-1]
         return codes[(codes >= start_code) & (codes <= end_code)].tolist()
 
-    # -------- Per-day Bars --------
     # Only the active universe, anything still held, and orders about to fill.
     def _scan_tickers(self) -> set[str]:
         tickers: set[str] = set(self.strategy.tickers)
@@ -781,9 +651,10 @@ class Backtester:
             data = self._data.get(ticker)
             if data is None:
                 continue
-            codes = data["codes"]
+            arrays = data["arrays"]
+            codes = arrays[0]
             index: int = data["cursor"]
-            length: int = len(codes)
+            length: int = codes.size
             while index < length and codes[index] < code:
                 index += 1
             data["cursor"] = index
@@ -791,10 +662,10 @@ class Backtester:
                 data["index"] = index
                 data["index_code"] = code
                 bars[ticker] = (
-                    float(data["open"][index]),
-                    float(data["high"][index]),
-                    float(data["low"][index]),
-                    float(data["close"][index]),
+                    float(arrays[1][index]),
+                    float(arrays[2][index]),
+                    float(arrays[3][index]),
+                    float(arrays[4][index]),
                 )
             else:
                 data["index"] = None
@@ -814,39 +685,12 @@ class Backtester:
             self.strategy._indicator_series = data["series"]
             self.strategy._indicator_ticker = ticker
 
-    # Today's view of one loaded ticker.
+    # Today's view of one loaded ticker: the shared object, cut to today's bar.
     def _history_as_of(self, ticker: str, index: int) -> StockData:
-        return self._slice_history(self._data[ticker]["history"], index)
+        history = self._store[ticker]
+        history.set_window(0, index + 1)
+        return history
 
-    # Cut a history so its last bar is the given index, giving strategies a no-lookahead view.
-    @staticmethod
-    def _slice_history(history: StockData, index: int) -> StockData:
-        end: int = index + 1
-        return StockData.view(
-            history.ticker,
-            history.date_codes[:end],
-            history.open_price[:end],
-            history.high[:end],
-            history.low[:end],
-            history.close_price[:end],
-            history.volume[:end],
-        )
-
-    # Cut a history to a half-open bar range. Slicing NumPy gives views, so this
-    # shares memory with the bulk read instead of copying it.
-    @staticmethod
-    def _slice_range(history: StockData, lo: int, hi: int) -> StockData:
-        return StockData.view(
-            history.ticker,
-            history.date_codes[lo:hi],
-            history.open_price[lo:hi],
-            history.high[lo:hi],
-            history.low[lo:hi],
-            history.close_price[lo:hi],
-            history.volume[lo:hi],
-        )
-
-    # -------- Daily Loop Helpers --------
     # Ask the strategy for entries on every name it may still buy.
     def _process_tickers(self, current_date: str, bars: dict[str, tuple[float, float, float, float]], timed_day: bool) -> None:
         universe: set[str] = self._universe_tickers
@@ -868,10 +712,7 @@ class Backtester:
                 has_position_capacity: bool = max_positions is None or bool(held) or self.manager.active_positions < max_positions
                 if can_add_lot and has_position_capacity:
                     self._publish_series(ticker)
-                    # len(history.dates) is exactly index + 1, and the index is
-                    # already known: skip building the StockData view when the
-                    # outcome is certainly "too few bars". The len() check
-                    # below stays as the decider, so behavior cannot change.
+                    # len(dates) is index + 1, so a certainly-too-short history never builds a view.
                     index = self._index_on_day(self._data.get(ticker))
                     if index is not None and index + 1 < min_bars:
                         continue
@@ -944,9 +785,10 @@ class Backtester:
 
 # One ticker's price columns, keyed by the memory address of their first bar.
 def _series_by_address(history: StockData) -> dict[int, np.ndarray]:
+    _codes, opens, highs, lows, closes, volumes = history.full
     return {
         array.ctypes.data: array
-        for array in (history.open_price, history.high, history.low, history.close_price, history.volume)
+        for array in (opens, highs, lows, closes, volumes)
         if isinstance(array, np.ndarray)
     }
 
@@ -969,3 +811,75 @@ def _kurtosis(values: np.ndarray) -> float:
 def _normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
+
+# -------- Stamp --------
+# What a run is made of, so results cache and compare fairly: package, data versions, range, costs, strategy knobs.
+_MISSING = object()
+
+
+# The installed package version, or "unknown" when it cannot be determined.
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version as _dist_version
+        return _dist_version("sltp")
+    except Exception:
+        return "unknown"
+
+
+# Where the run's bars came from: "own:<dir>" or "cache@<version>".
+def _data_source() -> str:
+    try:
+        from sltp.data.paths import source
+
+        info = source()
+        if info.get("kind") == "cache":
+            return f"cache@{info.get('version', 'unknown')}"
+        return f"own:{info.get('dir', '?')}"
+    except Exception:
+        return "unknown"
+
+    # The published data version, or "unknown" when the manifest was never read.
+def _data_version() -> str:
+    try:
+        from sltp.data.remote import read_manifest
+        return str(read_manifest().get("version", "unknown"))
+    except Exception:
+        return "unknown"
+
+
+# A value that survives json.dumps, or _MISSING when it cannot be represented.
+def _stamp_scalar(value):
+    value = getattr(value, "value", value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        item is None or isinstance(item, (bool, int, float, str)) for item in value
+    ):
+        return list(value)
+    return _MISSING
+
+
+# The strategy's knobs: its constraints plus any public scalar the subclass set.
+def _strategy_params(strategy) -> dict:
+    base: set[str] = set(vars(Strategy()))
+    custom: dict = {}
+    for key, value in vars(strategy).items():
+        if key in base or key.startswith("_"):
+            continue
+        scalar = _stamp_scalar(value)
+        if scalar is not _MISSING:
+            custom[key] = scalar
+    return {
+        "class": type(strategy).__name__,
+        "name": getattr(strategy, "name", None),
+        "constraints": {
+            "max_positions": _stamp_scalar(getattr(strategy, "MAX_POSITIONS", None)),
+            "max_allocation_per_ticker": _stamp_scalar(getattr(strategy, "MAX_ALLOCATION_PER_TICKER", None)),
+            "max_lots_per_ticker": _stamp_scalar(getattr(strategy, "MAX_LOTS_PER_TICKER", None)),
+            "rebalance_frequency": _stamp_scalar(getattr(strategy, "REBALANCE_FREQUENCY", None)),
+            "min_bars_required": _stamp_scalar(getattr(strategy, "MIN_BARS_REQUIRED", None)),
+            "lookback_bars": _stamp_scalar(getattr(strategy, "LOOKBACK_BARS", None)),
+            "liquidate_on_end": _stamp_scalar(getattr(strategy, "LIQUIDATE_ON_END", None)),
+        },
+        "custom": custom,
+    }

@@ -1,7 +1,5 @@
 # -------- base_strategy.py --------
 # Base class for a strategy: hooks, universe access and indicators.
-# Only on_signal is required; the other hooks do nothing unless you override them.
-# A strategy makes the decisions and keeps no book, and sees the portfolio read-only.
 
 # -------- Imports --------
 import numpy as np
@@ -47,17 +45,14 @@ class Strategy:
         self.REBALANCE_FREQUENCY: RebalanceFrequency = RebalanceFrequency.NEVER
         self.MIN_BARS_REQUIRED: int = 0
         self.LIQUIDATE_ON_END: bool = False
-        # Sessions of history the engine guarantees before the start date, for
-        # indicators and universe ranking. None keeps the five-year default;
-        # set it to trim the bulk read down to what the strategy actually uses.
+        # Sessions of history the engine guarantees before the start date, for indicators and universe ranking.
         self.LOOKBACK_BARS: int | None = None
 
         # -------- Tickers --------
         self.tickers: list[str] = []
 
         # -------- Indicators --------
-        # The series being polled, published by the backtester, and what has been
-        # computed from it so far. Both stay None until the first call needs them.
+        # The series being polled, published by the backtester, and what has been computed from it so far.
         self._indicator_series: dict[int, np.ndarray] | None = None
         self._indicator_cache: OrderedDict = OrderedDict()
         self._indicator_cache_bytes: int = 0
@@ -122,12 +117,10 @@ class Strategy:
 
     # -------- Lifecycle Hooks --------
     # Build the starting universe; the default accepts the declared tickers.
-    # The None default is a promise the hook ignores histories, so the engine skips loading them.
     def initialize_universe(self, current_date: str, histories: dict[str, StockData] | None = None) -> bool:
         return bool(self.tickers)
 
     # Refresh self.tickers when REBALANCE_FREQUENCY comes due.
-    # The None default is a promise the hook ignores histories, so the engine skips loading them.
     def on_rebalance(self, current_date: str, histories: dict[str, StockData] | None = None) -> None:
         return None
 
@@ -177,7 +170,6 @@ class Strategy:
         return self._ta(ta.ADX, (window,), (high, low, close))
 
     # Stochastic oscillator: the close relative to its recent range.
-    # The two zeros keep TA-Lib's default SMA smoothing for %K and %D.
     def _stochastic(self, high, low, close, fast_k=5, slow_k=3, slow_d=3):
         return self._ta(ta.STOCH, (fast_k, slow_k, 0, slow_d, 0), (high, low, close))
 
@@ -240,14 +232,14 @@ class Strategy:
 
         if trade.position_type == PositionType.LONG:
             # Long: stop below the highest price since entry.
-            highest_since_entry = np.max(data.high[entry_idx:])
+            highest_since_entry = np.max(data.highs[entry_idx:])
             trailing_stop = highest_since_entry * (1.0 - pct)
-            return bool(data.low[-1] <= trailing_stop)
+            return bool(data.lows[-1] <= trailing_stop)
         else:
             # Short: stop above the lowest price since entry.
-            lowest_since_entry = np.min(data.low[entry_idx:])
+            lowest_since_entry = np.min(data.lows[entry_idx:])
             trailing_stop = lowest_since_entry * (1.0 + pct)
-            return bool(data.high[-1] >= trailing_stop)
+            return bool(data.highs[-1] >= trailing_stop)
 
     # True when price has moved against the entry by a multiple of the average true range.
     def _atr_stop(self, trade: Trade, multiplier: float, window: int = 14) -> bool:
@@ -257,9 +249,9 @@ class Strategy:
         start_idx = max(0, entry_idx - window - 1)
 
         data = trade.history
-        high = data.high[start_idx:entry_idx + 1]
-        low = data.low[start_idx:entry_idx + 1]
-        close = data.close_price[start_idx:entry_idx + 1]
+        high = data.highss[start_idx:entry_idx + 1]
+        low = data.lowss[start_idx:entry_idx + 1]
+        close = data.closes[start_idx:entry_idx + 1]
 
         atr_values = self._atr(high, low, close, window)
         # Only the last value has the full window behind it; the rest are warmup.
@@ -270,11 +262,11 @@ class Strategy:
         if trade.position_type == PositionType.LONG:
             # Long: the stop sits below the entry by ATR * multiplier.
             stop_price: float = trade.entry_price - (current_atr * multiplier)
-            return bool(data.low[-1] <= stop_price)
+            return bool(data.lows[-1] <= stop_price)
         else:
             # Short: the stop sits above the entry by ATR * multiplier.
             stop_price = trade.entry_price + (current_atr * multiplier)
-            return bool(data.high[-1] >= stop_price)
+            return bool(data.highs[-1] >= stop_price)
 
     # Position of the entry bar, falling back to the nearest bar if the date is absent.
     def _get_entry_index(self, trade: Trade) -> int:
@@ -314,9 +306,7 @@ class Strategy:
         self._indicator_cache_bytes = 0
         self._indicator_ticker = None
 
-    # Run one indicator and return today's value. The streaming path carries one
-    # scalar state per ticker and configuration forward to today's bar; anything
-    # unsupported, untracked or disabled falls through to the batch cache below.
+    # Run one indicator and return today's value.
     def _ta(self, func, params: tuple, arrays: tuple):
         series = self._series_window(arrays)
         if series is None:
@@ -343,10 +333,7 @@ class Strategy:
         if entry is None:
             computed = func(*self._widen(*series), *params)
             raw: tuple = computed if isinstance(computed, tuple) else (computed,)
-            # float32 halves the entry (~7 significant digits: a 6-digit price
-            # like berk.A's 1234.56 round-trips to <0.0001) while raw bars and
-            # fill accounting stay float32/float64 respectively, so signals and
-            # fills never lose a cent.
+            # float32 halves the entry (~7 digits: 1234.56 round-trips to <0.0001); bars stay float32, fills exact.
             outputs: tuple = tuple(
                 np.asarray(output, dtype=np.float32) if isinstance(output, np.ndarray) else output
                 for output in raw

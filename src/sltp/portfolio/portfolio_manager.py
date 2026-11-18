@@ -1,6 +1,5 @@
 # -------- portfolio_manager.py --------
 # Keeps the book: orders, fills, positions, costs and equity.
-# Orders fill at the next open, and equity is an index that starts at 100.
 
 # -------- Imports --------
 import numpy as np
@@ -21,7 +20,6 @@ from sltp.utils.PositionType import PositionType
 from sltp.utils.RebalanceFrequency import RebalanceFrequency
 
 # Database imports
-
 
 
 # -------- Rebalance Arithmetic --------
@@ -48,9 +46,7 @@ class PortfolioManager:
         # One-way spread cost per fill, and the largest share of a bar one fill may take.
         self.SPREAD_PCT: float = 0.0
         self.MAX_PARTICIPATION: float | None = None
-        # Smallest fill worth booking, in dollars of notional. Anything smaller
-        # waits whole for the next open instead of opening a dust lot. 0.0
-        # disables the floor.
+        # Smallest fill worth booking, in dollars of notional. 0.0 disables the floor.
         self.MIN_FILL_NOTIONAL: float = 0.01
         # Annual borrow rate on open shorts, plus tickers that cannot be shorted at all.
         self.BORROW_RATE: float = 0.0
@@ -81,8 +77,7 @@ class PortfolioManager:
         self._trade_by_id: dict[int, Trade] = {}
         self.rejected_orders: dict[str, int] = {}
         self._histories: dict[str, StockData] = {}
-        # (ticker, date) -> history cut to that date, set by the backtester so fills
-        # in uncached tickers reuse the bulk read instead of re-reading bar files mid-run.
+        # (ticker, date) -> history cut to that date, filled by the engine so an uncached fill reuses the bulk read.
         self._history_loader = None
         self._dividend_events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_dividend_code: int | None = None
@@ -130,7 +125,6 @@ class PortfolioManager:
         return set(self._open_tickers)
 
     # Fees plus slippage plus spread plus borrow, for reporting.
-    # Slippage and spread are already inside the fill price; borrow is a daily cash debit.
     @property
     def total_trading_cost(self) -> float:
         return self.total_cost + self.total_slippage + self.total_spread + self.total_borrow_cost
@@ -201,8 +195,7 @@ class PortfolioManager:
             self.pending_exits.append(trade_id)
 
     # -------- Filling --------
-    # Fill every queued order at today's open. What the bar's volume would not
-    # take stays queued for the next open; an order with no bar is still dropped.
+    # Fill every queued order at today's open.
     def fill_pending_orders(self, current_date: str, opens: dict[str, float]) -> None:
         carried: list[Order] = []
         for order in self.pending_orders:
@@ -325,7 +318,6 @@ class PortfolioManager:
 
     # -------- Helpers --------
     # Validate the constraints, price the fill and record the trade.
-    # Returns the unfilled remainder to carry, or None when the order is done.
     def _fill_order(self, order: Order, open_price: float, current_date: str, volume: float | None = None) -> Order | None:
         ticker: str = order.ticker
         ticker_lots: list[Trade] = self.lots(ticker)
@@ -341,22 +333,17 @@ class PortfolioManager:
         if resolved <= 0.0 and order.sizing is OrderSizing.AVAILABLE:
             return None
 
-        # A fill pays its own fee out of the notional, so an oversized order
-        # downsizes to the cash instead of dying on a hairline shortfall.
+        # A fill pays its fee out of the notional, so an oversized order downsizes instead of dying on a shortfall.
         allocation: float = self._affordable_allocation(resolved, equity_at_entry)
 
-        # Affordability drove it to zero or below (cash within float dust of
-        # zero, even slightly negative): wait for an exit to free cash and
-        # carry whole. An order that itself asked for zero or negative stays
-        # invalid and falls through to the rejection below.
+        # Affordability drove it to zero or below (cash inside float dust): wait for an exit to free cash, carry whole.
         if allocation <= 0.0 and resolved > 0.0:
             return order
 
         if not self._validate_order_constraints(order, ticker, ticker_lots, allocation):
             return None
 
-        # Participation cap: one fill takes at most this share of the bar's
-        # volume, and the rest rejoins the queue for the next open.
+        # Participation cap: one fill takes at most this share of the bar's volume, the rest requeues for the next open.
         fill_allocation: float = allocation
         if self.MAX_PARTICIPATION is not None and volume is not None and equity_at_entry > 0:
             allowed: float = volume * open_price * self.MAX_PARTICIPATION / equity_at_entry
@@ -364,23 +351,16 @@ class PortfolioManager:
                 return order
             fill_allocation = min(allocation, allowed)
 
-        # What the bar would not take, in equity fractions. A fill smaller than
-        # a cent would print dust lots day after day, so the order waits whole.
+        # What the bar would not take, in equity fractions.
         unfilled: float = allocation - fill_allocation
         if unfilled * equity_at_entry >= self.MIN_FILL_NOTIONAL > fill_allocation * equity_at_entry:
             return order
 
-        # A fill under a cent is dust, not a position: carry the whole order
-        # instead of booking it. The guard above only waits when the leftover
-        # is meaningful; affordability can shrink the fill itself to dust with
-        # nothing left over, which is exactly the cash-exhausted case. A
-        # sub-cent fill cannot buy anything at cent-rounded prices, so tiny-
-        # but-complete orders wait too rather than opening dust lots.
+        # A fill under a cent is dust, not a position: carry the whole order instead of booking it.
         if fill_allocation * equity_at_entry < self.MIN_FILL_NOTIONAL:
             return order
 
-        # Slippage and spread both move against the position. Spread is the
-        # one-way cost, half the quoted spread, tracked apart from slippage.
+        # Slippage and spread both move against the position.
         if order.position_type is PositionType.LONG:
             slipped_price: float = open_price * (1.0 + self.SLIPPAGE_PCT)
             raw_entry: float = slipped_price * (1.0 + self.SPREAD_PCT)
@@ -398,18 +378,20 @@ class PortfolioManager:
             history = self._history_loader(ticker, current_date)
             if history is None:
                 raise ValueError(f"No local data found for {ticker} in master database.")
-        else:
-            # Slice the live history up to today so the trade never sees the future
-            end: int = int(np.searchsorted(history.date_codes, to_code(current_date), side="right"))
-            history = StockData(
-                ticker=ticker,
-                date_codes=history.date_codes[:end],
-                open_price=history.open_price[:end],
-                high=history.high[:end],
-                low=history.low[:end],
-                close_price=history.close_price[:end],
-                volume=history.volume[:end],
-            )
+
+        # The trade gets its own cut of the bars through today. The engine's object is a shared
+        # window that keeps moving, so a trade must never hold a reference to it.
+        all_codes, all_opens, all_highs, all_lows, all_closes, all_volumes = history.full
+        end: int = int(np.searchsorted(all_codes, to_code(current_date), side="right"))
+        history = StockData(
+            ticker=ticker,
+            date_codes=all_codes[:end],
+            opens=all_opens[:end],
+            highs=all_highs[:end],
+            lows=all_lows[:end],
+            closes=all_closes[:end],
+            volumes=all_volumes[:end],
+        )
 
         trade: Trade = Trade(
             id=self._next_trade_id,
@@ -448,7 +430,6 @@ class PortfolioManager:
         self.portfolio_value -= entry_fee
 
         # Carry what the bar would not take; a remainder under the floor is dust.
-        # Fixed-cash orders carry dollars, the rest carry equity fractions.
         if unfilled * equity_at_entry >= self.MIN_FILL_NOTIONAL:
             if order.sizing is OrderSizing.FIXED:
                 return replace(order, allocation=order.allocation - fill_allocation * equity_at_entry)
@@ -507,12 +488,15 @@ class PortfolioManager:
     # Today's traded volume for the participation cap, or None when unknown.
     def _day_volume(self, ticker: str, current_date: str) -> float | None:
         history: StockData | None = self._histories.get(ticker)
-        if history is None or len(history.date_codes) == 0:
+        if history is None:
+            return None
+        all_codes, _opens, _highs, _lows, _closes, all_volumes = history.full
+        if all_codes.size == 0:
             return None
         code: int = int(to_code(current_date))
-        index: int = int(np.searchsorted(history.date_codes, code, side="left"))
-        if index < len(history.date_codes) and int(history.date_codes[index]) == code:
-            return float(history.volume[index])
+        index: int = int(np.searchsorted(all_codes, code, side="left"))
+        if index < all_codes.size and int(all_codes[index]) == code:
+            return float(all_volumes[index])
         return None
 
     # The opening price for a ticker, or None after recording a refusal.
