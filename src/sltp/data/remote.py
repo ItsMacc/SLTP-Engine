@@ -16,7 +16,7 @@ from pathlib import Path
 
 # -------- Constants --------
 # Public bucket URL. Readers never authenticate; upload tokens stay on your machine.
-REMOTE_BASE_URL: str = "https://pub-8fe125f9d291408d9a41fa5228a663e2.r2.dev"
+REMOTE_BASE_URL: str = "https://sltp-data.magicaltitan7.workers.dev/v/live"
 # The bucket refuses the stock urllib user agent, so every request names us.
 USER_AGENT: str = "sltp"
 # Small file naming which bundles exist and what data version they belong to.
