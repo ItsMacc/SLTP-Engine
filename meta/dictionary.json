@@ -35,7 +35,7 @@
     "LastBar": "last session on disk, blank until downloaded",
     "ListingDate": "first listing date, YYYY-MM-DD, blank when unknown",
     "MIC": "ISO 10383 venue the row is listed on",
-    "Market": "US, India, Canada, Japan, United Kingdom, France, Switzerland, Germany, Australia, Netherlands, Spain, Sweden, Italy, Hong Kong, Singapore",
+    "Market": "US, India, Canada, Japan, United Kingdom, France, Switzerland, Germany, Australia, Netherlands, Sweden, Italy, Hong Kong, Singapore",
     "MarketCap": "market capitalisation in USD, blank outside the US",
     "MarketCapTier": "Mega | Large | Mid | Small | Micro | Nano Cap",
     "Name": "issuer or fund name",
@@ -46,9 +46,10 @@
     "SharesOut": "shares outstanding, blank outside the US",
     "Status": "active | lagging | missing; missing marks a symbol waiting for its first download",
     "Summary": "business or fund description",
-    "Symbol": "Yahoo ticker; exchange-suffixed outside the US (7203.T, BP.L, SHOP.TO)",
+    "Symbol": "our ticker and bar key, exchange-suffixed outside the US (BRK.A, 7203.T, BP.L)",
     "Universe": "US | INTERNATIONAL",
-    "Website": "issuer site"
+    "Website": "issuer site",
+    "YahooSymbol": "ticker yf.download expects; spelled differently for class and preferred shares (BRK-A, FITB-PI)"
    },
    "rows": "one row per downloadable symbol: every symbol we hold bars for plus the download queue"
   }
