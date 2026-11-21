@@ -377,9 +377,10 @@ def get_tickers(scope: Scope = "all") -> list[str]:
     raise ValueError(f"Unknown scope {scope!r}. Expected one of: all, stocks, missing.")
 
 
-# Every valid ticker in the catalog, sorted.
+# Every ticker with local bars, sorted; the catalog also lists symbols still to download.
 def get_all_tickers() -> list[str]:
-    return sorted(_names_by_symbol())
+    signature = (_signature(_catalog_path()), _bars_signature())
+    return _cached_value("all_tickers", signature, _read_all_tickers)
 
 
 # Ticker to company name, for callers that need the whole map.
@@ -487,6 +488,11 @@ def _status_source() -> str | None:
     if os.path.exists(LEGACY_STATUS_FILE):
         return LEGACY_STATUS_FILE
     return None
+
+
+# Catalog symbols that have bars, so a scan never offers a name without prices.
+def _read_all_tickers() -> list[str]:
+    return sorted(set(_names_by_symbol()) & set(_tickers_with_bars()))
 
 
 # The catalog's symbol to name map, cached per file change.
