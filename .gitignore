@@ -5,8 +5,10 @@ __pycache__/
 build/
 dist/
 
-# Bar files are data
-data/market/*.parquet
+# Bar files are data; the catalogue beside them is versioned
+data/MARKET_DATA/DAILY/
+data/MARKET_DATA/1-MINUTE/
+data/MARKET_DATA/1-HOUR/
 
 .DS_Store
 .idea/workspace.xml

@@ -1,42 +1,63 @@
 # -------- paths.py --------
-# Where the bar files live. The data is not shipped with the package, so lookup order:
-#   1. SLTP_DATA_DIR or `sltp data use`, naming the market directory or its parent.
+# Where the data lives. The data is not shipped with the package, so lookup order:
+#   1. SLTP_DATA_DIR or `sltp data use`, naming the data root or a directory inside it.
 #   2. The managed R2 cache in ~/.sltp/cache, refreshed according to auto-update.
-# Bars live in one flat file per year (market_data_YYYY.bin) plus the recent tail.
+#
+#   MARKET_DATA/
+#     symbol_catalog.parquet        every symbol of every market, one table
+#     DAILY/US/1998.bin             one bundle per calendar year, plus recent.bin
+#     DAILY/INTERNATIONAL/1998.bin  all international markets share one bundle per year
+#     1-MINUTE/  1-HOUR/            reserved for the intraday tiers
+#
 # The resolver returns a path even when the files are absent; the read layer raises.
 
 # -------- Imports --------
+import re
+
 from pathlib import Path
 
 from sltp.data import config as _config
 from sltp.data.remote import CACHE_MARKET_DIR
 
 
+# -------- Layout --------
+# The bar market the engine reads. International bundles publish under their own
+# directory and switch through this name once they exist.
+BAR_MARKET: str = "US"
+# A bundle is one calendar year, or the recent tail: 1998.bin, 2026.bin, recent.bin.
+BUNDLE_PATTERN: re.Pattern = re.compile(r"^(\d{4}|recent)\.bin$")
+CATALOG_NAME: str = "symbol_catalog.parquet"
+ACTIONS_NAME: str = "actions.parquet"
+
+
+# True when the name is a bar bundle, so discovery never picks up stray files.
+def is_bundle(name: str) -> bool:
+    return BUNDLE_PATTERN.match(name) is not None
+
+
 # -------- Resolution --------
-# Explicit choices only: `sltp data use` (or SLTP_DATA_DIR for one-off runs).
-# Anything else resolves to the managed cache, so the default is always fresh
-# R2 bars and a repo checkout never shadows them by accident.
+# Explicit choices only: the data root, its MARKET_DATA/DAILY/<market> directory,
+# or that directory itself. Anything else resolves to the managed cache, so the
+# default is always fresh R2 bars and a repo checkout never shadows them by accident.
 def _candidates() -> list[Path]:
     roots: list[Path] = []
 
     configured = _config.data_override()
     if configured is not None:
-        roots.append(configured / "market")
+        roots.append(configured / "MARKET_DATA" / "DAILY" / BAR_MARKET)
+        roots.append(configured / "DAILY" / BAR_MARKET)
+        roots.append(configured / BAR_MARKET)
         roots.append(configured)
 
     return roots
 
 
-# True when a path holds bars: at least one non-trivial flat bundle.
+# True when a path holds bars: at least one non-trivial bundle.
 def _has_data(root: Path) -> bool:
     if not root.is_dir():
         return False
     for entry in root.iterdir():
-        if not (
-            entry.is_file()
-            and entry.name.startswith("market_data_")
-            and entry.name.endswith(".bin")
-        ):
+        if not (entry.is_file() and is_bundle(entry.name)):
             continue
         try:
             if entry.stat().st_size > 24:
@@ -50,7 +71,7 @@ def has_bars(directory) -> bool:
     return _has_data(Path(str(directory)).expanduser())
 
 
-# The directory holding the bar files.
+# The directory holding the bar files for BAR_MARKET.
 def market_dir() -> Path:
     roots: list[Path] = _candidates()
     for root in roots:
@@ -60,6 +81,15 @@ def market_dir() -> Path:
     # lazily; a machine with local files never reaches this line.
     CACHE_MARKET_DIR.mkdir(parents=True, exist_ok=True)
     return CACHE_MARKET_DIR
+
+
+# The directory holding the symbol catalogue, which sits above the bar folders.
+def symbol_data_dir() -> Path:
+    market: Path = market_dir()
+    for parent in (market, market.parent, market.parent.parent):
+        if (parent / CATALOG_NAME).is_file():
+            return parent
+    return market.parent.parent
 
 
 # True when reads resolve to the R2 cache, meaning the network may be used.
@@ -76,15 +106,6 @@ def source() -> dict:
 
         return {"kind": "cache", "dir": str(chosen), "version": cached_version() or "unknown"}
     return {"kind": "own", "dir": str(chosen), "version": "local"}
-
-
-# The directory holding the symbol catalog.
-def symbol_data_dir() -> Path:
-    market: Path = market_dir()
-    inside: Path = market / "symbol_data"
-    if inside.is_dir():
-        return inside
-    return market.parent / "symbol_data"
 
 
 # True when the bar files are present, so callers can fail early with a good message.

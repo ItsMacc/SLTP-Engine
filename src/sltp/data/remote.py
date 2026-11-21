@@ -22,17 +22,18 @@ USER_AGENT: str = "sltp"
 # Small file naming which bundles exist and what data version they belong to.
 MANIFEST_KEY: str = "META/manifest.json"
 VERSION_KEY: str = "META/version.txt"
-# The two files a backtest always needs, whatever the date range.
-CATALOG_KEY: str = "SYMBOL_DATA/symbol_catalog.parquet"
-ACTIONS_KEY: str = "MARKET_DAILY/market_actions.parquet"
-# Bar bundles live as MARKET_DAILY/market_data_<year>.bin. The manifest lists
-# every file with its size and session range, so sync, prune and range overlap
-# treat bundle bytes as plain downloads.
-# Where downloaded bundles live. Separate from ~/.sltp/data so cached R2 files
-# never mix with a user's own bar files.
+# The bucket mirrors data/MARKET_DATA: the catalogue at the root, one directory
+# per bar market, one bundle per year named <year>.bin.
+BARS_PREFIX: str = "MARKET_DATA/DAILY/US/"
+CATALOG_KEY: str = "MARKET_DATA/symbol_catalog.parquet"
+ACTIONS_KEY: str = "MARKET_DATA/DAILY/US/actions.parquet"
+# The manifest lists every file with its size and session range, so sync, prune
+# and range overlap treat bundle bytes as plain downloads.
+# Where downloaded files live. Separate from the repo so cached R2 files never
+# mix with a user's own bar files.
 CACHE_ROOT: Path = Path.home() / ".sltp" / "cache"
-CACHE_MARKET_DIR: Path = CACHE_ROOT / "MARKET_DAILY"
-CACHE_SYMBOL_DIR: Path = CACHE_ROOT / "SYMBOL_DATA"
+CACHE_MARKET_DIR: Path = CACHE_ROOT / "MARKET_DATA" / "DAILY" / "US"
+CACHE_SYMBOL_DIR: Path = CACHE_ROOT / "MARKET_DATA"
 # One process checks the published version once; later calls trust the marker.
 _VERSION_CHECKED: bool = False
 # True while `sltp data update` runs: an explicit refresh downloads even when
@@ -201,14 +202,14 @@ def sync_actions(fetch=None, cache_root: Path = CACHE_ROOT) -> Path:
     return dest
 
 
-# Only the MARKET_DAILY bundles a date range can touch. Open bounds mean the
+# Only the bar bundles a date range can touch. Open bounds mean the
 # whole archive, which is what latest-date and full-universe queries need.
 def sync_bars(start: str | None, end: str | None, fetch=None, cache_root: Path = CACHE_ROOT) -> list[Path]:
     _check_version(fetch, cache_root)
     manifest = read_manifest(fetch)
     synced: list[Path] = []
     for entry in manifest["files"]:
-        if not entry["key"].startswith("MARKET_DAILY/") or entry["key"] == ACTIONS_KEY:
+        if not entry["key"].startswith(BARS_PREFIX) or entry["key"] == ACTIONS_KEY:
             continue
         if _overlaps(entry, start, end):
             synced.append(ensure_local(entry["key"], cache_root, fetch, entry.get("bytes")))

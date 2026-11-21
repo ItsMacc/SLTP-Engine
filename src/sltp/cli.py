@@ -522,6 +522,8 @@ def _command_compare(args) -> int:
 # -------- Data --------
 # How big a directory is, in MB, counting bar bundles plus catalog/actions.
 def _data_mb(directory: str) -> float:
+    from sltp.data.paths import is_bundle
+
     total: int = 0
     for name in os.listdir(directory):
         full = os.path.join(directory, name)
@@ -530,7 +532,7 @@ def _data_mb(directory: str) -> float:
                 total += os.path.getsize(full)
             except OSError:
                 pass
-        elif name.startswith("market_data_") and name.endswith(".bin"):
+        elif is_bundle(name):
             try:
                 total += os.path.getsize(full)
             except OSError:
@@ -541,7 +543,7 @@ def _data_mb(directory: str) -> float:
 # `sltp data` with no action, and `sltp data status`: where bars come from.
 def _command_data_status() -> int:
     from sltp.data import config as _config
-    from sltp.data.paths import has_bars, source
+    from sltp.data.paths import has_bars, is_bundle, source
 
     info = source()
     kind, directory = info["kind"], info["dir"]
@@ -565,10 +567,7 @@ def _command_data_status() -> int:
         entries = os.listdir(directory)
     except OSError:
         entries = []
-    bundles = sum(
-        1 for name in entries
-        if name.startswith("market_data_") and name.endswith(".bin")
-    )
+    bundles = sum(1 for name in entries if is_bundle(name))
     print(f"files       {bundles} flat bundles, {_data_mb(directory)} MB")
     return 0
 
@@ -588,14 +587,14 @@ def _command_data_update() -> int:
 
 # `sltp data check`: every flat bundle must carry the columns the engine reads, with the byte sizes its header promises.
 def _command_data_check(path: str | None) -> int:
-    from sltp.data.paths import has_bars, market_dir
+    from sltp.data.paths import has_bars, is_bundle, market_dir
 
     directory = os.path.abspath(os.path.expanduser(path)) if path else str(market_dir())
     if not os.path.isdir(directory):
         print(f"error: no such directory: {directory}", file=sys.stderr)
         return 1
     if not has_bars(directory):
-        print(f"error: {directory} holds no bar files (want market_data_* bundles)", file=sys.stderr)
+        print(f"error: {directory} holds no bar files (want <year>.bin bundles)", file=sys.stderr)
         return 1
     bundle_cols = (
         ("sym", 2),
@@ -608,39 +607,37 @@ def _command_data_check(path: str | None) -> int:
     )
     bad: int = 0
     for name in sorted(os.listdir(directory)):
-        if not name.startswith("market_data_"):
+        if not is_bundle(name):
             continue
         full = os.path.join(directory, name)
-        if name.endswith(".bin"):
-            try:
-                import gzip
+        try:
+            import gzip
 
-                from sltp.data.market_data_service import FLAT_PREAMBLE, read_flat_header
+            from sltp.data.market_data_service import FLAT_PREAMBLE, read_flat_header
 
-                index = read_flat_header(full)
-                problems: list[str] = []
-                rows = int(index.get("rows", -1))
-                symbols, starts, counts = index.get("symbols", []), index.get("starts", []), index.get("counts", [])
-                if rows <= 0 or not (len(symbols) == len(starts) == len(counts)):
-                    problems.append("bad symbol table")
-                elif sum(int(c) for c in counts) != rows or int(starts[0]) != 0:
-                    problems.append("runs do not cover all rows")
-                want = sum(rows * width for _, width in bundle_cols)
-                size = os.path.getsize(full)
-                with open(full, "rb") as handle:
-                    handle.seek(FLAT_PREAMBLE.size + int(index["header_len"]))
-                    payload = handle.read()
-                if int(index.get("format", 1)) == 2:
-                    payload = gzip.decompress(payload)
-                if len(payload) != want:
-                    problems.append(f"payload is {len(payload)} bytes, want {want}")
-                status = "ok" if not problems else "FAIL"
-                detail = f"{rows:,} rows" + ("" if not problems else "; " + "; ".join(problems))
-            except Exception as error:
-                status, detail = "FAIL", f"unreadable ({error})"
-            if status == "FAIL":
-                bad += 1
-            print(f"  {status:<4} {name}  {detail}")
+            index = read_flat_header(full)
+            problems: list[str] = []
+            rows = int(index.get("rows", -1))
+            symbols, starts, counts = index.get("symbols", []), index.get("starts", []), index.get("counts", [])
+            if rows <= 0 or not (len(symbols) == len(starts) == len(counts)):
+                problems.append("bad symbol table")
+            elif sum(int(c) for c in counts) != rows or int(starts[0]) != 0:
+                problems.append("runs do not cover all rows")
+            want = sum(rows * width for _, width in bundle_cols)
+            with open(full, "rb") as handle:
+                handle.seek(FLAT_PREAMBLE.size + int(index["header_len"]))
+                payload = handle.read()
+            if int(index.get("format", 1)) == 2:
+                payload = gzip.decompress(payload)
+            if len(payload) != want:
+                problems.append(f"payload is {len(payload)} bytes, want {want}")
+            status = "ok" if not problems else "FAIL"
+            detail = f"{rows:,} rows" + ("" if not problems else "; " + "; ".join(problems))
+        except Exception as error:
+            status, detail = "FAIL", f"unreadable ({error})"
+        if status == "FAIL":
+            bad += 1
+        print(f"  {status:<4} {name}  {detail}")
     print("all files valid" if bad == 0 else f"{bad} file(s) need attention")
     return 1 if bad else 0
 
@@ -668,7 +665,7 @@ def _command_data(args) -> int:
             print(f"error: no such directory: {directory}", file=sys.stderr)
             return 1
         if not has_bars(directory):
-            print(f"error: {directory} holds no bar files (want market_data_YYYY.bin)", file=sys.stderr)
+            print(f"error: {directory} holds no bar files (want <year>.bin bundles)", file=sys.stderr)
             return 1
         _config.set_data_override(directory)
         print(f"reading bars from {directory}")

@@ -4,5 +4,5 @@
 #
 #   from sltp.data.market_data_service import get_stock_history, get_all_tickers
 #
-# The bar files are one flat bundle per year (market_data_YYYY.bin) plus the
-# recent tail; the reader discovers whatever the range needs.
+# The bar files are one flat bundle per calendar year (1998.bin) plus the recent
+# tail; the reader discovers whatever the range needs.

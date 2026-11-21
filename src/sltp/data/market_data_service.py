@@ -1,5 +1,5 @@
 # -------- market_data_service.py --------
-# Cached read layer over the bar files and market_actions.parquet.
+# Cached read layer over the bar files and actions.parquet.
 
 # -------- Imports --------
 import contextlib
@@ -24,13 +24,13 @@ from sltp.utils.StockData import StockData
 # Package imports
 from sltp.data import remote as _remote
 from sltp.data.catalog import ETF, GOLD, STOCK, CATEGORY_COLUMN
-from sltp.data.paths import market_dir, symbol_data_dir, using_remote_cache
+from sltp.data.paths import is_bundle, market_dir, symbol_data_dir, using_remote_cache
 
 
 # -------- Paths & Constants --------
 MARKET_DIR: str = str(market_dir())
 SYMBOL_DATA_DIR: str = str(symbol_data_dir())
-ACTIONS_FILE: str = os.path.join(MARKET_DIR, "market_actions.parquet")
+ACTIONS_FILE: str = os.path.join(MARKET_DIR, "actions.parquet")
 CATALOG_FILE: str = os.path.join(SYMBOL_DATA_DIR, "symbol_catalog.parquet")
 # Pre-merge filenames, kept only as a local fallback so existing checkouts keep working.
 LEGACY_SYMBOLS_FILE: str = os.path.join(SYMBOL_DATA_DIR, "symbols.parquet")
@@ -60,13 +60,13 @@ _LOAD_LOCK = threading.RLock()  # without it, concurrent cold requests each load
 
 
 # -------- Bar Files --------
-# One flat bundle per year: MARKET_DAILY/market_data_<year>.bin. Nothing else is read.
-FLAT_YEAR_PATTERN: re.Pattern = re.compile(r"^market_data_(\d{4})\.bin$")
+# One flat bundle per calendar year named <year>.bin. Nothing else is read.
+FLAT_YEAR_PATTERN: re.Pattern = re.compile(r"^(\d{4})\.bin$")
 FLAT_MAGIC: bytes = b"SLTPFLAT"
 # 1: raw column payload. 2: gzip-compressed column payload, header still raw.
 FLAT_FORMAT: int = 2
 FLAT_PREAMBLE: struct.Struct = struct.Struct("<8sIIQ")
-FLAT_RECENT_NAME: str = "market_data_recent.bin"
+FLAT_RECENT_NAME: str = "recent.bin"
 FLAT_COLS: tuple = (
     ("sym", np.dtype("<u2"), 2),
     ("date", np.dtype("<u2"), 2),
@@ -138,7 +138,7 @@ def _flat_bundles() -> list:
         sig = tuple(
             (name, os.path.getsize(os.path.join(MARKET_DIR, name)))
             for name in os.listdir(MARKET_DIR)
-            if name.startswith("market_data_") and name.endswith(".bin")
+            if is_bundle(name)
         )
     except OSError:
         return []
@@ -537,7 +537,7 @@ def _selected_histories(symbols: list[str], start: str | None = None, end: str |
     wanted: list[str] = list(dict.fromkeys(symbols))
     if not flat_files_for(start, end):
         raise RuntimeError(
-            f"no bar files in {MARKET_DIR} (want market_data_YYYY.bin);"
+            f"no bar files in {MARKET_DIR} (want <year>.bin bundles);"
             " run `sltp data update` or point at your own files with `sltp data use`"
         )
     with _LOAD_LOCK:

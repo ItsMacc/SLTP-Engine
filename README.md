@@ -286,7 +286,7 @@ sltp data check ./my_bars # validate a folder before you trust it
 sltp reset                # forget every setting, behave like a fresh install
 ```
 
-Bringing your own bars: put one flat bundle per year named `market_data_YYYY.bin` plus `market_actions.parquet` in a folder, then run `sltp data check` on it and `sltp data use` it. Build the bundles from yearly parquet (`Symbol, Date, Open, High, Low, Close, Volume` columns, rows sorted) with `python -m sltp.data.build_flat <parquet dir> <out dir>`. No network, no surprises: with `auto off` the engine never phones home and runs on local files, warning when they go stale instead of failing.
+Bringing your own bars: put one flat bundle per calendar year named `1998.bin`, … plus `actions.parquet` in a folder, then run `sltp data check` on it and `sltp data use` it. Build the bundles from yearly parquet (`Symbol, Date, Open, High, Low, Close, Volume` columns, rows sorted) with `python -m sltp.data.build_flat <parquet dir> <out dir>`. No network, no surprises: with `auto off` the engine never phones home and runs on local files, warning when they go stale instead of failing.
 
 ## CLI commands
 
