@@ -20,7 +20,7 @@ from sltp.utils.StockData import StockData
 from sltp.utils.PositionType import PositionType
 
 # Database imports
-from sltp.data.market_data_service import get_dividends, get_trading_calendar, _get_histories, _run_guard
+from sltp.market.market_data import _histories, calendar, dividends, run_guard
 
 
 # -------- Constants --------
@@ -107,7 +107,7 @@ class Backtester:
         if self._has_run:
             raise RuntimeError("This Backtester has already run. Build a new one for another simulation.")
         self._has_run = True
-        with _run_guard():
+        with run_guard():
             return self._run(quiet)
 
 
@@ -472,7 +472,7 @@ class Backtester:
         histories: dict[str, StockData] = {}
         # Ranking only reads back from today, so the files after today cannot contribute.
         window_start: str = self._load_start_for(current_date)
-        for ticker, history in _get_histories(self.strategy.available_universe, window_start, current_date).items():
+        for ticker, history in _histories(self.strategy.available_universe, window_start, current_date).items():
             index: int = int(np.searchsorted(history.full[0], code, side="right")) - 1
             if index >= 0:
                 history.set_window(0, index + 1)
@@ -504,7 +504,7 @@ class Backtester:
         ]
         if not missing:
             return
-        loaded: dict[str, StockData] = _get_histories(missing, self.load_start, self.end_date)
+        loaded: dict[str, StockData] = _histories(missing, self.load_start, self.end_date)
         for symbol in missing:
             history: StockData | None = loaded.get(symbol)
             if history is None:
@@ -579,7 +579,7 @@ class Backtester:
             ticker for ticker in missing if ticker not in loaded and ticker not in self._universe_skipped
         ]
         if unread:
-            loaded.update(_get_histories(unread, self.load_start, self.end_date))
+            loaded.update(_histories(unread, self.load_start, self.end_date))
         for ticker in missing:
             history: StockData | None = loaded.get(ticker)
             if history is None:
@@ -604,7 +604,7 @@ class Backtester:
             history: StockData | None = self._store.get(ticker)
             if history is None or ticker in self._dividend_events:
                 continue
-            codes, amounts = get_dividends(ticker, self.load_start, self.end_date)
+            codes, amounts = dividends(ticker, self.load_start, self.end_date)
             codes, amounts = self._plausible_dividends(history, codes, amounts)
             if codes.size:
                 self._dividend_events[ticker] = (codes, amounts)
@@ -627,7 +627,7 @@ class Backtester:
     def _build_calendar(self, actual_start: str) -> list:
         if not self._store:
             raise ValueError("No price data loaded. initialize_universe() must add locally available tickers.")
-        codes = get_trading_calendar(actual_start, self.end_date)
+        codes = calendar(actual_start, self.end_date)
         start_code = to_code(actual_start)
         end_code = to_code(self.end_date) if self.end_date is not None else codes[-1]
         return codes[(codes >= start_code) & (codes <= end_code)].tolist()

@@ -5,15 +5,14 @@
 #
 #   MARKET_DATA/
 #     symbol_catalog.parquet        every symbol of every market, one table
-#     DAILY/US/1998.bin             one bundle per calendar year, plus recent.bin
-#     DAILY/INTERNATIONAL/1998.bin  all international markets share one bundle per year
-#     1-MINUTE/  1-HOUR/            reserved for the intraday tiers
+#     DAILY/US/*.bin                one bundle per chunk, any size and any name
+#     DAILY/INTERNATIONAL/*.bin     all international markets share one bundle per chunk
+#     1-MINUTE/  1-HOUR/            the intraday tiers, same shape
 #
+# A bundle is read for its header, never its name, so any chunking works.
 # The resolver returns a path even when the files are absent; the read layer raises.
 
 # -------- Imports --------
-import re
-
 from pathlib import Path
 
 from sltp.data import config as _config
@@ -21,35 +20,41 @@ from sltp.data.remote import CACHE_MARKET_DIR
 
 
 # -------- Layout --------
-# The bar market the engine reads. International bundles publish under their own
-# directory and switch through this name once they exist.
+# The bar market the engine reads by default, and the tier it reads it at.
 BAR_MARKET: str = "US"
-# A bundle is one calendar year, or the recent tail: 1998.bin, 2026.bin, recent.bin.
-BUNDLE_PATTERN: re.Pattern = re.compile(r"^(\d{4}|recent)\.bin$")
+FREQUENCY: str = "DAILY"
 CATALOG_NAME: str = "symbol_catalog.parquet"
 ACTIONS_NAME: str = "actions.parquet"
 
 
-# True when the name is a bar bundle, so discovery never picks up stray files.
-def is_bundle(name: str) -> bool:
-    return BUNDLE_PATTERN.match(name) is not None
+# True when the name is a bar file. Only the suffix is read; the header decides the rest.
+def is_bin(name: str) -> bool:
+    return str(name).lower().endswith(".bin")
 
 
 # -------- Resolution --------
-# Explicit choices only: the data root, its MARKET_DATA/DAILY/<market> directory,
-# or that directory itself. Anything else resolves to the managed cache, so the
-# default is always fresh R2 bars and a repo checkout never shadows them by accident.
-def _candidates() -> list[Path]:
-    roots: list[Path] = []
+# The shapes a chosen path may take, most specific first: a market directory, the tier
+# above it, the data root, or a directory of bundles straight from the user. Anything else
+# resolves to the managed cache, so a repo checkout never shadows it by accident.
+def _locate(configured: Path) -> Path | None:
+    candidates = (
+        configured / FREQUENCY / BAR_MARKET,
+        configured / "MARKET_DATA" / FREQUENCY / BAR_MARKET,
+        configured / BAR_MARKET,
+        configured / FREQUENCY,
+        configured / "MARKET_DATA" / FREQUENCY,
+        configured / "MARKET_DATA",
+        configured,
+    )
+    for root in candidates:
+        if _has_data(root):
+            return root
+    return None
 
-    configured = _config.data_override()
-    if configured is not None:
-        roots.append(configured / "MARKET_DATA" / "DAILY" / BAR_MARKET)
-        roots.append(configured / "DAILY" / BAR_MARKET)
-        roots.append(configured / BAR_MARKET)
-        roots.append(configured)
 
-    return roots
+# True when a chosen path holds bars in any shape the resolver accepts.
+def holds_bars(directory) -> bool:
+    return _locate(Path(str(directory)).expanduser()) is not None
 
 
 # True when a path holds bars: at least one non-trivial bundle.
@@ -57,7 +62,7 @@ def _has_data(root: Path) -> bool:
     if not root.is_dir():
         return False
     for entry in root.iterdir():
-        if not (entry.is_file() and is_bundle(entry.name)):
+        if not (entry.is_file() and is_bin(entry.name)):
             continue
         try:
             if entry.stat().st_size > 24:
@@ -67,16 +72,13 @@ def _has_data(root: Path) -> bool:
     return False
 
 
-def has_bars(directory) -> bool:
-    return _has_data(Path(str(directory)).expanduser())
-
-
 # The directory holding the bar files for BAR_MARKET.
 def market_dir() -> Path:
-    roots: list[Path] = _candidates()
-    for root in roots:
-        if _has_data(root):
-            return root
+    configured = _config.data_override()
+    if configured is not None:
+        found = _locate(Path(configured).expanduser())
+        if found is not None:
+            return found
     # No local bars, so the R2 cache becomes the market directory. Reads fill it
     # lazily; a machine with local files never reaches this line.
     CACHE_MARKET_DIR.mkdir(parents=True, exist_ok=True)

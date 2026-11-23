@@ -18,7 +18,7 @@ from sltp.utils.PositionType import PositionType
 from sltp.utils.RebalanceFrequency import RebalanceFrequency
 
 # Database imports
-from sltp.data.market_data_service import get_all_tickers, get_available_etfs, get_available_gold, get_available_stocks
+from sltp.market.market_data import available_etfs, available_gold, available_stocks, universe
 
 
 # -------- Constants --------
@@ -63,22 +63,22 @@ class Strategy:
     # Everything with local price data.
     @property
     def available_universe(self) -> list[str]:
-        return get_all_tickers()
+        return universe()
 
     # Exchange-traded funds only.
     @property
     def available_etfs(self) -> list[str]:
-        return get_available_etfs()
+        return available_etfs()
 
     # Individual companies only.
     @property
     def available_stocks(self) -> list[str]:
-        return get_available_stocks()
+        return available_stocks()
 
     # Gold proxies only.
     @property
     def available_gold(self) -> list[str]:
-        return get_available_gold()
+        return available_gold()
 
     # The tickers currently holding open positions.
     @property

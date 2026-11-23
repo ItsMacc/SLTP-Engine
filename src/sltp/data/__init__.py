@@ -1,8 +1,8 @@
 # -------- __init__.py --------
-# The market-data layer: a cached flat-bundle reader and the tool that builds the files.
+# The market-data layer's inputs: the catalogue, the action tables and the bundle writer.
 # Nothing is imported here on purpose, so importing sltp.data costs nothing.
 #
-#   from sltp.data.market_data_service import get_stock_history, get_all_tickers
+#   from sltp.market.market_data import get_stock_history, universe
 #
-# The bar files are one flat bundle per calendar year (1998.bin) plus the recent
-# tail; the reader discovers whatever the range needs.
+# The bar files are five-year flat bundles (1998-2002.bin) with a sidecar index in
+# sltp/market; the reader maps only the chunks a request touches.

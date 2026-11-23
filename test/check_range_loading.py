@@ -8,10 +8,10 @@ import time
 
 import numpy as np
 
-import sltp.data.market_data_service as service
+from sltp.market import market_data as service
 
 from sltp import Backtester, Strategy
-from sltp.data.market_data_service import flat_files_for
+from sltp.market.market_data import files_for as flat_files_for
 from sltp.utils import Order, PositionType
 
 
@@ -100,18 +100,22 @@ class TrendFilter(Strategy):
 
 
 # -------- Runner --------
-def run(strategy: type, label: str) -> dict:
-    service.refresh_market_data_cache()
+def run(strategy: type, label: str, lookback: int | None = None) -> dict:
+    service.refresh()
+    instance = strategy()
+    if lookback is not None:
+        instance.LOOKBACK_BARS = lookback
     backtester = Backtester(
-        strategy=strategy(),
+        strategy=instance,
         start_date="2020-01-02",
         end_date="2020-12-31",
     )
     # The engine's own window, so the count matches the files it really reads.
-    reading = len(service.flat_files_for(backtester.load_start, backtester.end_date))
+    reading = len(flat_files_for(backtester.load_start, backtester.end_date))
     started = time.time()
     result = backtester.run()
     elapsed = time.time() - started
+    result["files_read"] = reading
     print(f"  {label:<22} {elapsed:5.1f}s  files={reading}  "
           f"sessions={len(result['equity']):>4}  trades={len(result['trades'])}")
     return result
@@ -134,13 +138,8 @@ def main() -> int:
     limited = run(TrendFilter, "range-aware")
     buy_hold = run(BuyAndHold, "range-aware B&H")
 
-    # The same run with pruning disabled: every file, every time.
-    original = service.flat_files_for
-    service.flat_files_for = lambda start=None, end=None: everything
-    try:
-        full = run(TrendFilter, "full file set")
-    finally:
-        service.flat_files_for = original
+    # The same run reaching back to the first bundle: if pruning dropped warm-up bars, this differs.
+    full = run(TrendFilter, "long warm-up", lookback=7000)
 
     print()
     problems: list[str] = []
@@ -148,15 +147,18 @@ def main() -> int:
     if len(window) >= len(everything):
         problems.append(f"pruning selected every file ({len(window)} of {len(everything)})")
 
+    if full["files_read"] <= limited["files_read"]:
+        problems.append("the long warm-up run read no extra bundles, so the comparison proves nothing")
+
     if not limited["trades"]:
         problems.append("the 200-day strategy never traded: warm-up bars are missing")
 
     if limited["equity"] != full["equity"]:
-        problems.append("equity curves differ between pruned and full file sets")
+        problems.append("equity curves differ between the pruned and the long warm-up run")
     if limited["metrics"] != full["metrics"]:
-        problems.append("metrics differ between pruned and full file sets")
+        problems.append("metrics differ between the pruned and the long warm-up run")
     if len(limited["trades"]) != len(full["trades"]):
-        problems.append("trade counts differ between pruned and full file sets")
+        problems.append("trade counts differ between the pruned and the long warm-up run")
 
     if buy_hold["equity"]:
         end_value = float(buy_hold["equity"][-1]["portfolio_value"])
@@ -172,7 +174,7 @@ def main() -> int:
         return 1
 
     print()
-    print("ok: range-aware loading is lossless")
+    print("ok: a pruned run matches one that reaches back to the first bundle")
     return 0
 
 

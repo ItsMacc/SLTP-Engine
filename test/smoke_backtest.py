@@ -7,7 +7,7 @@ import resource
 import sys
 
 from sltp import Backtester, Strategy
-from sltp.data.market_data_service import flat_files_for, get_latest_trading_date
+from sltp.market.market_data import files_for as flat_files_for, latest_date as get_latest_trading_date
 from sltp.utils import Order, PositionType
 
 

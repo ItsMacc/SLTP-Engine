@@ -13,6 +13,7 @@ import re
 import sys
 
 from datetime import datetime
+from pathlib import Path
 
 
 # The installed version without importing the package, so --version never waits on numpy and pyarrow.
@@ -194,9 +195,9 @@ def _instantiate(candidate: type) -> Strategy:
 def _period(start: str | None, end: str | None) -> tuple[str, str]:
     from dateutil.relativedelta import relativedelta
 
-    from sltp.data.market_data_service import get_latest_trading_date
+    from sltp.market.market_data import latest_date
 
-    latest: str = get_latest_trading_date()
+    latest: str = latest_date()
     end = end or latest
     if start is None:
         start = (datetime.strptime(end, "%Y-%m-%d") - relativedelta(years=DEFAULT_YEARS)).strftime("%Y-%m-%d")
@@ -520,30 +521,24 @@ def _command_compare(args) -> int:
 
 
 # -------- Data --------
-# How big a directory is, in MB, counting bar bundles plus catalog/actions.
+# How big a directory tree is, in MB, counting bar files plus catalog/actions.
 def _data_mb(directory: str) -> float:
-    from sltp.data.paths import is_bundle
-
     total: int = 0
-    for name in os.listdir(directory):
-        full = os.path.join(directory, name)
-        if name.endswith(".parquet"):
-            try:
-                total += os.path.getsize(full)
-            except OSError:
-                pass
-        elif is_bundle(name):
-            try:
-                total += os.path.getsize(full)
-            except OSError:
-                pass
+    for base, _dirs, names in os.walk(directory):
+        for name in names:
+            if name.lower().endswith((".bin", ".parquet")):
+                try:
+                    total += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    pass
     return round(total / (1 << 20), 1)
 
 
 # `sltp data` with no action, and `sltp data status`: where bars come from.
 def _command_data_status() -> int:
     from sltp.data import config as _config
-    from sltp.data.paths import has_bars, is_bundle, source
+    from sltp.data.paths import BAR_MARKET, source, symbol_data_dir
+    from sltp.market import layout
 
     info = source()
     kind, directory = info["kind"], info["dir"]
@@ -563,12 +558,19 @@ def _command_data_status() -> int:
                 print("latest      unreachable (offline?)")
     else:
         print(f"version     local files (auto-update {'on' if auto else 'off'}; refresh only affects the cache)")
-    try:
-        entries = os.listdir(directory)
-    except OSError:
-        entries = []
-    bundles = sum(1 for name in entries if is_bundle(name))
-    print(f"files       {bundles} flat bundles, {_data_mb(directory)} MB")
+    root = Path(symbol_data_dir())
+    tiers = [(freq, market) for freq in layout.frequencies(root)
+             for market in layout.markets(freq, root)]
+    tiers.sort(key=lambda item: (item[1] != BAR_MARKET, item[0], item[1]))
+    if not tiers:
+        print("files       no bar files found")
+        return 0
+    for at, (freq, market) in enumerate(tiers):
+        found = layout.bundles(market, freq, root)
+        size = round(sum(path.stat().st_size for _label, path in found) / (1 << 20), 1)
+        label = "files" if at == 0 else "     "
+        print(f"{label}       {freq}/{market}  {len(found)} bundles, {size} MB")
+    print(f"{'total':<11} {_data_mb(str(root))} MB")
     return 0
 
 
@@ -585,66 +587,69 @@ def _command_data_update() -> int:
     return 0
 
 
-# `sltp data check`: every flat bundle must carry the columns the engine reads, with the byte sizes its header promises.
-def _command_data_check(path: str | None) -> int:
-    from sltp.data.paths import has_bars, is_bundle, market_dir
+# `sltp data check`: every .bin under a tier, a market or a directory, read for its header.
+# Names are never parsed, so any chunking is validated the same way.
+def _command_data_check(target: str | None) -> int:
+    from sltp.market import index as _index
 
-    directory = os.path.abspath(os.path.expanduser(path)) if path else str(market_dir())
-    if not os.path.isdir(directory):
-        print(f"error: no such directory: {directory}", file=sys.stderr)
+    base = _check_base(target)
+    if base is None:
         return 1
-    if not has_bars(directory):
-        print(f"error: {directory} holds no bar files (want <year>.bin bundles)", file=sys.stderr)
+    files = sorted(path for path in base.rglob("*.bin") if path.is_file())
+    if not files:
+        print(f"error: {base} holds no .bin files", file=sys.stderr)
         return 1
-    bundle_cols = (
-        ("sym", 2),
-        ("date", 2),
-        ("open", 4),
-        ("high", 4),
-        ("low", 4),
-        ("close", 4),
-        ("vol", 4),
-    )
+    groups: dict = {}
+    for path in files:
+        groups.setdefault(str(path.parent), []).append(path)
     bad: int = 0
-    for name in sorted(os.listdir(directory)):
-        if not is_bundle(name):
-            continue
-        full = os.path.join(directory, name)
-        try:
-            import gzip
-
-            from sltp.data.market_data_service import FLAT_PREAMBLE, read_flat_header
-
-            index = read_flat_header(full)
-            problems: list[str] = []
-            rows = int(index.get("rows", -1))
-            symbols, starts, counts = index.get("symbols", []), index.get("starts", []), index.get("counts", [])
-            if rows <= 0 or not (len(symbols) == len(starts) == len(counts)):
-                problems.append("bad symbol table")
-            elif sum(int(c) for c in counts) != rows or int(starts[0]) != 0:
-                problems.append("runs do not cover all rows")
-            want = sum(rows * width for _, width in bundle_cols)
-            with open(full, "rb") as handle:
-                handle.seek(FLAT_PREAMBLE.size + int(index["header_len"]))
-                payload = handle.read()
-            if int(index.get("format", 1)) == 2:
-                payload = gzip.decompress(payload)
-            if len(payload) != want:
-                problems.append(f"payload is {len(payload)} bytes, want {want}")
-            status = "ok" if not problems else "FAIL"
-            detail = f"{rows:,} rows" + ("" if not problems else "; " + "; ".join(problems))
-        except Exception as error:
-            status, detail = "FAIL", f"unreadable ({error})"
-        if status == "FAIL":
+    for directory in sorted(groups):
+        if len(groups) > 1:
+            print(os.path.relpath(directory, base))
+        for path in groups[directory]:
+            problems = _index.problems(path)
+            bad += 1 if problems else 0
+            detail = "; ".join(problems) if problems else f"{_index.header(path)['rows']:,} rows"
+            print(f"  {'FAIL' if problems else 'ok':<4} {path.name}  {detail}")
+        for earlier, later, first, last in _layout_overlaps(Path(directory)):
             bad += 1
-        print(f"  {status:<4} {name}  {detail}")
-    print("all files valid" if bad == 0 else f"{bad} file(s) need attention")
+            print(f"  FAIL {later.name} and {earlier.name} both cover {first}..{last}")
+    print(f"{len(files)} files valid" if bad == 0 else f"{bad} of {len(files)} file(s) need attention")
     return 1 if bad else 0
+
+
+# Bundle pairs in one directory whose sessions collide, whatever they are called.
+def _layout_overlaps(directory: Path) -> list:
+    from sltp.market import layout
+
+    return layout.overlaps(directory)
+
+
+# Where a check starts: every tier, one tier, one market, or an explicit directory.
+def _check_base(target: str | None) -> Path | None:
+    from sltp.data.paths import symbol_data_dir
+    from sltp.market import layout
+
+    root = Path(symbol_data_dir())
+    if target is None:
+        # The canonical root holds every tier; a folder of your own may hold just one.
+        return root if (root / layout.FREQUENCY).is_dir() else layout.frequency_dir()
+    expanded = Path(os.path.expanduser(target))
+    if expanded.is_dir():
+        return expanded.absolute()
+    if str(target) in layout.frequencies(root):
+        return layout.frequency_dir(str(target), root)
+    for freq in layout.frequencies(root):
+        market = layout.frequency_dir(freq, root) / str(target)
+        if market.is_dir():
+            return market
+    print(f"error: no such directory, tier or market: {target}", file=sys.stderr)
+    return None
 
 
 def _command_data(args) -> int:
     from sltp.data import config as _config
-    from sltp.data.paths import has_bars
+    from sltp.data.paths import holds_bars
 
     action = args.data_command or "status"
     if action == "status":
@@ -664,8 +669,8 @@ def _command_data(args) -> int:
         if not os.path.isdir(directory):
             print(f"error: no such directory: {directory}", file=sys.stderr)
             return 1
-        if not has_bars(directory):
-            print(f"error: {directory} holds no bar files (want <year>.bin bundles)", file=sys.stderr)
+        if not holds_bars(directory):
+            print(f"error: {directory} holds no .bin files, here or below it", file=sys.stderr)
             return 1
         _config.set_data_override(directory)
         print(f"reading bars from {directory}")
@@ -765,8 +770,9 @@ def build_parser() -> argparse.ArgumentParser:
     use_group = use.add_mutually_exclusive_group(required=True)
     use_group.add_argument("path", nargs="?", metavar="DIR", help="a directory holding the bar files")
     use_group.add_argument("--clear", action="store_true", help="forget the directory and use the default")
-    check = data_sub.add_parser("check", help="validate a directory of bar files")
-    check.add_argument("path", nargs="?", metavar="DIR", help="the directory to validate (default: the one in use)")
+    check = data_sub.add_parser("check", help="validate every .bin under a tier, market or directory")
+    check.add_argument("path", nargs="?", metavar="PATH",
+                       help="a directory, DAILY/1-MINUTE or a market name (default: every tier in use)")
 
     reset = subparsers.add_parser(
         "reset",

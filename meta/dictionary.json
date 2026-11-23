@@ -8,7 +8,7 @@
  "datasets": {
   "market_actions": {
    "columns": {
-    "Amount": "split ratio (Kind 0; e.g. 7.0 is 7-for-1, 0.1 is 1-for-10 reverse) or cash per share in dollars (Kind 1)",
+    "Amount": "split ratio (Kind 0; 7.0 is 7-for-1, 0.1 is 1-for-10 reverse) or cash per share in the bar's own price unit (Kind 1, already divided by PriceDivisor)",
     "Date": "int32 days since 1970-01-01",
     "Kind": "0 = split, 1 = dividend",
     "Symbol": "ticker, e.g. AAPL"
@@ -44,7 +44,7 @@
     "Sector": "GICS sector, 11 buckets, FinanceDatabase",
     "SectorSource": "financedatabase | previous | blank when unknown",
     "SharesOut": "shares outstanding, blank outside the US",
-    "Status": "active | lagging | missing; missing marks a symbol waiting for its first download",
+    "Status": "active | lagging | stopped | missing; missing means no bars were ever served, stopped means the bars on disk end well before the last session",
     "Summary": "business or fund description",
     "Symbol": "our ticker and bar key, exchange-suffixed outside the US (BRK.A, 7203.T, BP.L)",
     "Universe": "US | INTERNATIONAL",
@@ -52,16 +52,47 @@
     "YahooSymbol": "ticker yf.download expects; spelled differently for class and preferred shares (BRK-A, FITB-PI)"
    },
    "rows": "one row per downloadable symbol: every symbol we hold bars for plus the download queue"
+  },
+  "fx": {
+   "columns": {
+    "Date": "int32 days since 1970-01-01",
+    "EUR": "USD per 1 EUR on that session",
+    "GBP": "USD per 1 GBP on that session",
+    "JPY": "USD per 1 JPY on that session",
+    "CAD": "USD per 1 CAD on that session",
+    "AUD": "USD per 1 AUD on that session",
+    "SEK": "USD per 1 SEK on that session",
+    "SGD": "USD per 1 SGD on that session",
+    "CHF": "USD per 1 CHF on that session",
+    "HKD": "USD per 1 HKD on that session",
+    "INR": "USD per 1 INR on that session"
+   },
+   "real_quote_since": {
+    "AUD": "1998-01-01",
+    "CAD": "1998-01-01",
+    "CHF": "1998-01-01",
+    "EUR": "1999-01-04",
+    "GBP": "1998-01-01",
+    "HKD": "1998-01-01",
+    "INR": "1998-01-01",
+    "JPY": "1998-01-01",
+    "SEK": "1998-01-01",
+    "SGD": "1998-01-01"
+   },
+   "rows": "one row per session from 1998. A gap carries the previous rate; a session before a currency's real_quote_since repeats that first quote and is an approximation, stamped in the file's schema metadata as sltp_fx_real_since"
   }
  },
- "date_encoding": "int32 days since 1970-01-01 (e.g. 20760 = 2026-11-03)",
+ "date_encoding": "int32 days since 1970-01-01 (e.g. 20777 = 2026-11-20)",
  "layout": {
   "MARKET_DATA/1-HOUR": "reserved intraday tier",
   "MARKET_DATA/1-MINUTE": "reserved intraday tier",
-  "MARKET_DATA/DAILY/INTERNATIONAL/<year>.bin": "all 14 international markets in one bundle per year",
+  "MARKET_DATA/DAILY/INTERNATIONAL/<year>.bin": "all 13 international markets in one bundle per year",
+  "MARKET_DATA/DAILY/INTERNATIONAL/actions.parquet": "international splits and dividends",
   "MARKET_DATA/DAILY/US/<year>.bin": "US daily bars, one bundle per calendar year",
   "MARKET_DATA/DAILY/US/actions.parquet": "US splits and dividends",
-  "MARKET_DATA/DAILY/US/recent.bin": "US tail since the last yearly close",
+  "MARKET_DATA/DELISTED/<market>/bars.parquet": "parked delisted bars, outside every reader path",
+  "MARKET_DATA/DELISTED/<market>/catalog.parquet": "catalogue rows for the parked names",
+  "MARKET_DATA/fx.parquet": "daily FX to USD, one column per currency (USD per unit)",
   "MARKET_DATA/symbol_catalog.parquet": "download registry, one row per symbol"
  }
 }
