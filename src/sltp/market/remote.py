@@ -15,18 +15,21 @@ from pathlib import Path
 
 
 # -------- Constants --------
-# Public bucket URL. Readers never authenticate; upload tokens stay on your machine.
-REMOTE_BASE_URL: str = "https://sltp-data.magicaltitan7.workers.dev/v/live"
+# Public bucket URL, straight at the R2 custom domain: R2 serves the keys itself, so no
+# worker sits in front. Readers never authenticate; upload tokens stay on your machine.
+REMOTE_BASE_URL: str = "https://data.sltp-app.com"
 # The bucket refuses the stock urllib user agent, so every request names us.
 USER_AGENT: str = "sltp"
 # Small file naming which bundles exist and what data version they belong to.
 MANIFEST_KEY: str = "META/manifest.json"
 VERSION_KEY: str = "META/version.txt"
-# The bucket mirrors data/MARKET_DATA: the catalogue at the root, one directory
-# per bar market, one bundle per year named <year>.bin.
-BARS_PREFIX: str = "MARKET_DATA/DAILY/US/"
+# Keys are cache-relative paths, so the bucket tree is the cache tree: a URL is the
+# base plus the key, nothing more.
+# The catalogue sits at the root, then one directory per bar market, one bundle per
+# year named <year>.bin, and one actions file per market.
+BARS_PREFIX: str = "MARKET_DATA/DAILY/"
 CATALOG_KEY: str = "MARKET_DATA/symbol_catalog.parquet"
-ACTIONS_KEY: str = "MARKET_DATA/DAILY/US/actions.parquet"
+ACTIONS_NAME: str = "actions.parquet"
 # The manifest lists every file with its size and session range, so sync, prune
 # and range overlap treat bundle bytes as plain downloads.
 # Where downloaded files live. Separate from the repo so cached R2 files never
@@ -192,14 +195,17 @@ def sync_catalog(fetch=None, cache_root: Path = CACHE_ROOT) -> Path:
     return dest
 
 
-# The corporate-actions file; tiny, so it always comes down whole.
-def sync_actions(fetch=None, cache_root: Path = CACHE_ROOT) -> Path:
+# The corporate-actions files, one per bar market; tiny, so they always come down whole.
+def sync_actions(fetch=None, cache_root: Path = CACHE_ROOT) -> list[Path]:
     _check_version(fetch, cache_root)
     manifest = read_manifest(fetch)
-    entry = next(e for e in manifest["files"] if e["key"] == ACTIONS_KEY)
-    dest = ensure_local(ACTIONS_KEY, cache_root, fetch, entry.get("bytes"))
+    dests = [
+        ensure_local(entry["key"], cache_root, fetch, entry.get("bytes"))
+        for entry in manifest["files"]
+        if entry["key"].rsplit("/", 1)[-1] == ACTIONS_NAME
+    ]
     (cache_root / "version.txt").write_text(manifest["version"], encoding="utf-8")
-    return dest
+    return dests
 
 
 # Only the bar bundles a date range can touch. Open bounds mean the
@@ -209,7 +215,7 @@ def sync_bars(start: str | None, end: str | None, fetch=None, cache_root: Path =
     manifest = read_manifest(fetch)
     synced: list[Path] = []
     for entry in manifest["files"]:
-        if not entry["key"].startswith(BARS_PREFIX) or entry["key"] == ACTIONS_KEY:
+        if not entry["key"].startswith(BARS_PREFIX) or not entry["key"].endswith(".bin"):
             continue
         if _overlaps(entry, start, end):
             synced.append(ensure_local(entry["key"], cache_root, fetch, entry.get("bytes")))
