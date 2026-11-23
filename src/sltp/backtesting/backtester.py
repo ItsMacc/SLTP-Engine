@@ -432,16 +432,16 @@ class Backtester:
             self._hook_time[name] = self._hook_time.get(name, 0.0) + (time.perf_counter() - start)
             self._hook_calls[name] = self._hook_calls.get(name, 0) + 1
 
-    # Call a universe hook, passing as-of histories when the strategy asks for them.
+    # Call a universe hook, passing as-of histories whenever it declares the parameter.
     def _call_universe_hook(self, hook, current_date: str):
+        # The base hooks only report what is already there, so they never need a snapshot.
+        if getattr(hook, "__func__", None) in (Strategy.initialize_universe, Strategy.on_rebalance):
+            return self._timed_hook(hook.__name__, hook, current_date)
         parameters = list(inspect.signature(hook).parameters.values())
         accepts_histories: bool = len(parameters) >= 2 or any(
             parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters
         )
         if accepts_histories:
-            histories_param = parameters[1] if len(parameters) >= 2 else None
-            if histories_param is not None and histories_param.default is None:
-                return self._timed_hook(hook.__name__, hook, current_date)
             return self._timed_hook(hook.__name__, hook, current_date, self._histories_as_of(current_date))
         return self._timed_hook(hook.__name__, hook, current_date)
 

@@ -407,18 +407,24 @@ def _label(days: int) -> str:
 
 # One ticker's actions of a given kind, as (day codes, amounts) inside the range.
 def _actions(ticker: str, kind: int, start: str | None, end: str | None) -> tuple:
+    empty = (np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32))
     symbol: str = ticker.strip().upper()
     market = _panel().market_of(symbol)
-    frame = _actions_table(market) if market is not None else None
-    if frame is None:
-        return np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.float32)
+    table = _actions_table(market) if market is not None else None
+    if table is None:
+        return empty
+    # Rows are grouped by symbol once, so a lookup is one dict hit and a slice, not a scan.
+    span: tuple | None = table["rows"].get(symbol)
+    if span is None:
+        return empty
+    window = slice(*span)
     low: int = int(to_code(start or START))
     high: int | None = None if end is None else int(to_code(end))
-    codes: np.ndarray = frame["Date"]
-    keep = (frame["Symbol"] == symbol) & (frame["Kind"] == kind) & (codes >= low)
+    codes: np.ndarray = table["date"][window]
+    keep = (table["kind"][window] == kind) & (codes >= low)
     if high is not None:
         keep &= codes <= high
-    return codes[keep].astype(np.int32), frame["Amount"][keep].astype(np.float32)
+    return codes[keep].astype(np.int32, copy=False), table["amount"][window][keep].astype(np.float32, copy=False)
 
 
 # One market's action file as plain arrays, read once per file version.
@@ -432,7 +438,18 @@ def _actions_table(market: str) -> dict | None:
     if entry is not None and entry[0] == signature:
         return entry[1]
     table = pq.read_table(path, columns=["Symbol", "Date", "Kind", "Amount"])
-    frame = {name: table.column(name).to_numpy() for name in ("Symbol", "Date", "Kind", "Amount")}
+    symbols = table.column("Symbol").to_numpy(zero_copy_only=False)
+    order = np.argsort(symbols, kind="stable")
+    ordered = symbols[order]
+    edges = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])
+    ends = np.r_[edges[1:], len(order)]
+    frame = {
+        "rows": {str(name): (int(first), int(last))
+                 for name, first, last in zip(ordered[edges], edges, ends)},
+        "date": table.column("Date").to_numpy()[order],
+        "kind": table.column("Kind").to_numpy()[order],
+        "amount": table.column("Amount").to_numpy()[order],
+    }
     _STATE["actions"] = (signature, frame)
     return frame
 

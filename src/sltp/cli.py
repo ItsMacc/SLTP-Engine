@@ -394,9 +394,9 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefi
     if len(series) < 2:
         try:
             if args.out:
-                benchmark, _ = _run_quiet(_BuyAndHold(), start, end, not args.no_dividends)
+                benchmark, _ = _run_quiet(_BuyAndHold(), start, end, not args.no_dividends, _friction_kwargs(args))
             else:
-                benchmark = _run(_BuyAndHold(), start, end, not args.no_dividends)
+                benchmark = _run(_BuyAndHold(), start, end, not args.no_dividends, _friction_kwargs(args))
             if benchmark["equity"]:
                 series.append(ChartSeries.from_equity(BENCHMARK_NAME, benchmark["equity"], color=BENCHMARK_COLOR))
         except Exception as error:
