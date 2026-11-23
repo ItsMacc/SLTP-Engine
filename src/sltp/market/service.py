@@ -11,7 +11,7 @@ import mmap
 import numpy as np
 import pyarrow.parquet as pq
 
-from sltp.data.paths import CATALOG_NAME, symbol_data_dir
+from sltp.market.layout import CATALOG_NAME, symbol_data_dir
 from sltp.market import index, layout
 
 

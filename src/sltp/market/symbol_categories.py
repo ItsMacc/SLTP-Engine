@@ -2,7 +2,7 @@
 # Writes a Category column (stock | etf | gold) into symbol_catalog.parquet, so the read
 # layer never has to guess. Evidence in order: the gold funds list, the exchange ETF
 # flags, then name keywords for listings the US files miss. Whatever is left is a stock.
-# Rerun whenever the catalog changes: python -m sltp.data.symbol_categories
+# Rerun whenever the catalog changes: python -m sltp.market.symbol_categories
 
 # -------- Imports --------
 from __future__ import annotations
@@ -13,11 +13,11 @@ import os
 
 from datetime import date
 
-from sltp.data.catalog import (
+from sltp.market.catalog import (
     CATEGORY_COLUMN, COMPANY_MARKERS, ETF, GOLD, GOLD_FUNDS, STOCK,
     STRONG_FUND_WORDS, WEAK_FUND_WORDS,
 )
-from sltp.data.paths import symbol_data_dir
+from sltp.market.layout import symbol_data_dir
 
 
 # -------- Paths & Constants --------

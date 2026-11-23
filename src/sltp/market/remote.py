@@ -3,7 +3,7 @@
 # No credentials, no new dependencies: plain HTTPS with urllib, reads with pyarrow.
 # The browser passes its own fetch (JS fetch bridge); the desktop uses the default.
 #
-#   from sltp.data.remote import ensure_local, sync_bars, sync_catalog
+#   from sltp.market.remote import ensure_local, sync_bars, sync_catalog
 
 # -------- Imports --------
 import json
@@ -137,7 +137,7 @@ def ensure_local(key: str, cache_root: Path = CACHE_ROOT, fetch=None, size: int 
     dest = cache_root / key
     if dest.is_file() and (size is None or dest.stat().st_size == size):
         return dest
-    from sltp.data import config as _config
+    from sltp.market import config as _config
 
     if not _REFRESHING and not _config.auto_update():
         raise RuntimeError(
@@ -155,7 +155,7 @@ def _check_version(fetch=None, cache_root: Path = CACHE_ROOT) -> None:
     if _VERSION_CHECKED:
         return
     _VERSION_CHECKED = True
-    from sltp.data import config as _config
+    from sltp.market import config as _config
 
     if not _REFRESHING and not _config.auto_update():
         return
@@ -220,7 +220,7 @@ def sync_bars(start: str | None, end: str | None, fetch=None, cache_root: Path =
 # True when the network is off-limits: auto-update is off and nobody explicitly
 # asked for a refresh. Sync entry points check this before touching R2.
 def offline() -> bool:
-    from sltp.data import config as _config
+    from sltp.market import config as _config
 
     return not _REFRESHING and not _config.auto_update()
 

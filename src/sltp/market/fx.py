@@ -12,7 +12,7 @@ import pyarrow.parquet as pq
 
 from pathlib import Path
 
-from sltp.data.paths import CATALOG_NAME, symbol_data_dir
+from sltp.market.layout import CATALOG_NAME, symbol_data_dir
 
 
 # -------- Constants --------

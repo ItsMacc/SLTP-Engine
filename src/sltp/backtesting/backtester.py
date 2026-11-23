@@ -829,7 +829,7 @@ def _package_version() -> str:
 # Where the run's bars came from: "own:<dir>" or "cache@<version>".
 def _data_source() -> str:
     try:
-        from sltp.data.paths import source
+        from sltp.market.layout import source
 
         info = source()
         if info.get("kind") == "cache":
@@ -841,7 +841,7 @@ def _data_source() -> str:
     # The published data version, or "unknown" when the manifest was never read.
 def _data_version() -> str:
     try:
-        from sltp.data.remote import read_manifest
+        from sltp.market.remote import read_manifest
         return str(read_manifest().get("version", "unknown"))
     except Exception:
         return "unknown"

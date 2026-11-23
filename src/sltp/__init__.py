@@ -3,7 +3,7 @@
 #
 #   from sltp import Strategy, Backtester, Order, PositionType
 #
-# sltp.data is deliberately not exported: a strategy asks the engine for bars, it does not
+# sltp.market is deliberately not exported: a strategy asks the engine for bars, it does not
 # read bar files itself. Set SLTP_DATA_DIR before importing when the bars live elsewhere.
 #
 # Nothing heavy is imported here. The names below resolve on first use, so importing

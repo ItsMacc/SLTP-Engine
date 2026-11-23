@@ -13,7 +13,7 @@ import threading
 import numpy as np
 import pyarrow.parquet as pq
 
-from sltp.data.catalog import ETF, GOLD, STOCK
+from sltp.market.catalog import ETF, GOLD, STOCK
 from sltp.market import index, layout, service
 from sltp.utils.Dates import labels_from_codes, register, to_code
 from sltp.utils.StockData import StockData

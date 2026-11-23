@@ -535,8 +535,8 @@ def _data_mb(directory: str) -> float:
 
 # `sltp data` with no action, and `sltp data status`: where bars come from.
 def _command_data_status() -> int:
-    from sltp.data import config as _config
-    from sltp.data.paths import BAR_MARKET, source, symbol_data_dir
+    from sltp.market import config as _config
+    from sltp.market.layout import BAR_MARKET, source, symbol_data_dir
     from sltp.market import layout
 
     info = source()
@@ -549,7 +549,7 @@ def _command_data_status() -> int:
         print(f"version     {local} (auto-update {'on' if auto else 'off'})")
         if auto:
             try:
-                from sltp.data.remote import read_remote_version
+                from sltp.market.remote import read_remote_version
 
                 remote = read_remote_version().strip()
                 print(f"latest      {remote}" + (" (up to date)" if remote == local else " (run `sltp data update`)"))
@@ -575,7 +575,7 @@ def _command_data_status() -> int:
 
 # `sltp data update`: pull every bundle from R2, whatever auto says.
 def _command_data_update() -> int:
-    from sltp.data import remote as _remote
+    from sltp.market import remote as _remote
 
     try:
         result = _remote.refresh_all()
@@ -626,7 +626,7 @@ def _layout_overlaps(directory: Path) -> list:
 
 # Where a check starts: every tier, one tier, one market, or an explicit directory.
 def _check_base(target: str | None) -> Path | None:
-    from sltp.data.paths import symbol_data_dir
+    from sltp.market.layout import symbol_data_dir
     from sltp.market import layout
 
     root = Path(symbol_data_dir())
@@ -647,8 +647,8 @@ def _check_base(target: str | None) -> Path | None:
 
 
 def _command_data(args) -> int:
-    from sltp.data import config as _config
-    from sltp.data.paths import holds_bars
+    from sltp.market import config as _config
+    from sltp.market.layout import holds_bars
 
     action = args.data_command or "status"
     if action == "status":
@@ -681,7 +681,7 @@ def _command_data(args) -> int:
 
 # `sltp reset`: forget every choice and behave like a fresh install.
 def _command_reset() -> int:
-    from sltp.data import config as _config
+    from sltp.market import config as _config
 
     _config.reset()
     print("settings restored to defaults: managed cache, auto-update on")
