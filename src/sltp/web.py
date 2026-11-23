@@ -12,6 +12,9 @@ FACADE_VERSION: int = 1
 BENCHMARK_TICKER: str = "SPY"
 BENCHMARK_NAME: str = "Buy & Hold (SPY)"
 BENCHMARK_COLOR: str = "#9aa3b2"
+# Curves already simulated, keyed by period and dividend setting: a chart is redrawn on every request.
+_BENCHMARKS: dict = {}
+_BENCHMARK_LIMIT: int = 8
 
 
 # -------- Normalizing --------
@@ -71,6 +74,10 @@ def to_jsonable(result: dict) -> dict:
 # -------- Chart --------
 # The benchmark a lone chart is drawn against, mirroring the CLI: one fund, bought and held.
 def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
+    key = (start, end, bool(dividends))
+    if key in _BENCHMARKS:
+        return _BENCHMARKS[key]
+
     from sltp.backtesting import Backtester
     from sltp.strategy import Strategy
     from sltp.utils import Order, PositionType
@@ -83,10 +90,9 @@ def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
             self.MAX_LOTS_PER_TICKER = 1
             self.MIN_BARS_REQUIRED = 1
 
-        def initialize_universe(self, current_date: str, histories=None) -> bool:
+        # One declared ticker, so the engine loads one history instead of ranking the whole archive.
+        def initialize_universe(self, current_date: str) -> bool:
             self.tickers.clear()
-            if BENCHMARK_TICKER not in self.available_universe:
-                return False
             self.add_ticker(BENCHMARK_TICKER)
             return True
 
@@ -102,9 +108,13 @@ def _benchmark(start: str, end: str, dividends: bool) -> list[dict]:
             )
 
     try:
-        return Backtester(_BuyAndHold(), start, end, dividends).run().get("equity") or []
+        equity = Backtester(_BuyAndHold(), start, end, dividends).run(quiet=True).get("equity") or []
     except Exception:
         return []
+    _BENCHMARKS[key] = equity
+    while len(_BENCHMARKS) > _BENCHMARK_LIMIT:
+        _BENCHMARKS.pop(next(iter(_BENCHMARKS)))
+    return equity
 
 
 # The chart for a result, string only. No equity means no chart, so an empty run returns None instead of raising.
@@ -143,7 +153,8 @@ def chart_svg(
 def run(strategy, start: str, end: str | None = None, dividends: bool = True, chart: bool = True) -> dict:
     from sltp.backtesting import Backtester
 
-    result = Backtester(strategy, start, end, dividends).run()
+    # Quiet: the caller gets a dict, so the hook breakdown has nowhere to go but a server log.
+    result = Backtester(strategy, start, end, dividends).run(quiet=True)
     payload = to_jsonable(result)
     payload["svg"] = (
         chart_svg(result, start=start, end=end, title=getattr(strategy, "name", None), dividends=dividends)

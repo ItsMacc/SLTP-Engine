@@ -371,10 +371,9 @@ def _emit_chart(args, named: list[tuple[str, dict]], start: str, end: str, prefi
             self.MAX_LOTS_PER_TICKER = 1
             self.MIN_BARS_REQUIRED = 1
 
-        def initialize_universe(self, current_date: str, histories=None) -> bool:
+        # One declared ticker, so the engine loads one history instead of ranking the whole archive.
+        def initialize_universe(self, current_date: str) -> bool:
             self.tickers.clear()
-            if BENCHMARK_TICKER not in self.available_universe:
-                return False
             self.add_ticker(BENCHMARK_TICKER)
             return True
 
