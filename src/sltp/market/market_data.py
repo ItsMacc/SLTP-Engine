@@ -243,10 +243,17 @@ def _build(panel, symbol: str, start: str | None, end: str | None) -> StockData 
     if not chosen:
         return None
 
-    # One concatenation per column, in C: a per-year assignment loop costs ~10 us a call.
-    codes: np.ndarray = np.concatenate([block["date"] for block in chosen]).astype(np.int32)
-    values: dict = {name: np.concatenate([block[column] for block in chosen])
-                    for column, name in FIELDS}
+    # One concatenation per column, in C: a per-year assignment loop costs ~10 us a call. A range
+    # inside a single bundle is served straight from the mapping, so a short read copies nothing.
+    if len(chosen) == 1:
+        block: dict = chosen[0]
+        codes: np.ndarray = block["date"]
+        values: dict = {name: block[column] for column, name in FIELDS}
+    else:
+        # Day codes stay at their stored u2 width; StockData keeps them, so nothing is widened here.
+        codes = np.concatenate([block["date"] for block in chosen])
+        values = {name: np.concatenate([block[column] for block in chosen])
+                  for column, name in FIELDS}
 
     total: int = int(codes.size)
     first: int = int(np.searchsorted(codes, low, side="left"))

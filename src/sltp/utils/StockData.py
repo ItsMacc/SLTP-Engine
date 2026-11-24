@@ -128,8 +128,10 @@ def _coerce_codes(value) -> np.ndarray:
         return array
     if array.dtype.kind in "USOM":
         return codes_from_labels(array)
+    # Keep the width the bars were stored at: a bundle holds day codes as u2, and widening them to
+    # int32 copies 2 extra bytes a bar on every read, which is most of what a viewed bundle costs.
     if array.dtype.kind in "iu":
-        return array.astype(np.int32)
+        return array if array.dtype in (np.uint16, np.int32) else array.astype(np.int32)
     raise TypeError(f"Cannot build dates from {array.dtype} values.")
 
 

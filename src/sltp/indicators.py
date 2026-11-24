@@ -17,6 +17,8 @@ import numpy as np
 # The only smoothing type implemented, and the scale CCI divides by.
 MATYPE_SMA: int = 0
 CCI_SCALE: float = 0.015
+# Decay ramps by (decay, length), shared by every call with the same period.
+_DECAYS: dict = {}
 
 
 # -------- Input Handling --------
@@ -70,17 +72,66 @@ def _wilder(values: np.ndarray, period: int, start: int = 0) -> np.ndarray:
     if not np.all(np.isfinite(window)):
         return out
 
-    previous = float(np.mean(window))
-    out[first] = previous
+    seed = float(np.mean(window))
+    out[first] = seed
     step = 1.0 / period
-    for i in range(first + 1, values.size):
-        current = values[i]
-        if not np.isfinite(current):
-            out[i] = previous
-            continue
-        previous = previous + (current - previous) * step
-        out[i] = previous
+    decay = 1.0 - step
+    tail = values[first + 1:]
+    finite = np.isfinite(tail)
+    if finite.all():
+        out[first + 1:] = _recurse(tail, decay, step, seed)
+        return out
+
+    # A missing bar carries the smoothed value forward, which splits the recursion into runs of
+    # finite bars; each run is one cumsum, so the loop below counts gaps, not bars.
+    previous = seed
+    begin = 0
+    for stop in np.append(np.flatnonzero(~finite), tail.size):
+        if stop > begin:
+            run = _recurse(tail[begin:stop], decay, step, previous)
+            out[first + 1 + begin:first + 1 + stop] = run
+            previous = run[-1]
+        if stop < tail.size:
+            out[first + 1 + stop] = previous
+        begin = stop + 1
     return out
+
+
+# One step of a first-order smoother: y[i] = decay * y[i-1] + step * x[i].
+#
+# The closed form is y[i] = decay**i * y0 + step * decay**i * sum(decay**-j * x[j]), which is one
+# cumulative sum. decay**-j grows, so the sum runs in blocks short enough to stay far inside
+# float64's range; 80 e-foldings is past its precision and still 1e35 at the far end, so the join
+# between blocks cannot be seen in the result.
+def _recurse(values: np.ndarray, decay: float, step: float, seed: float) -> np.ndarray:
+    output = np.empty(values.size, dtype=np.float64)
+    if values.size == 0:
+        return output
+    if decay <= 0.0:
+        return values * step
+
+    length = max(1, min(4096, int(80.0 / -math.log(decay))))
+    weights, powers = _decays(decay, length)
+
+    previous = seed
+    for begin in range(0, values.size, length):
+        block = values[begin:begin + length]
+        head = weights[:block.size]
+        sums = np.cumsum(block * powers[:block.size])
+        output[begin:begin + block.size] = head * previous + step * head * sums
+        previous = output[begin + block.size - 1]
+    return output
+
+
+# The two decay ramps, kept per (decay, length): a run computes the same period thousands of times
+# and they are read-only, so rebuilding them per call is the whole cost of a short series.
+def _decays(decay: float, length: int) -> tuple[np.ndarray, np.ndarray]:
+    key = (decay, length)
+    found = _DECAYS.get(key)
+    if found is None:
+        steps = np.arange(1, length + 1)
+        found = _DECAYS[key] = (decay ** steps, decay ** -steps)
+    return found
 
 
 # Exponential moving average, seeded with the SMA of the first full window.
@@ -103,12 +154,10 @@ def _ema(values: np.ndarray, period: int, start: int | None = None) -> np.ndarra
     if not np.all(np.isfinite(window)):
         return out
 
-    previous = float(np.mean(window))
-    out[first] = previous
+    seed = float(np.mean(window))
+    out[first] = seed
     weight = 2.0 / (period + 1.0)
-    for i in range(first + 1, values.size):
-        previous = values[i] * weight + previous * (1.0 - weight)
-        out[i] = previous
+    out[first + 1:] = _recurse(values[first + 1:], 1.0 - weight, weight, seed)
     return out
 
 
@@ -197,14 +246,15 @@ def RSI(values, timeperiod: int = 14) -> np.ndarray:
     gains = np.where(change > 0.0, change, 0.0)
     losses = np.where(change < 0.0, -change, 0.0)
 
+    step = 1.0 / timeperiod
     average_gain = float(np.mean(gains[:timeperiod]))
     average_loss = float(np.mean(losses[:timeperiod]))
     out[timeperiod] = _rsi_value(average_gain, average_loss)
 
-    for i in range(timeperiod + 1, series.size):
-        average_gain = (average_gain * (timeperiod - 1) + gains[i - 1]) / timeperiod
-        average_loss = (average_loss * (timeperiod - 1) + losses[i - 1]) / timeperiod
-        out[i] = _rsi_value(average_gain, average_loss)
+    # Wilder's recursion is a first-order smoother with step 1/period, so it is one cumsum.
+    smoothed_gains = _recurse(gains[timeperiod:], 1.0 - step, step, average_gain)
+    smoothed_losses = _recurse(losses[timeperiod:], 1.0 - step, step, average_loss)
+    out[timeperiod + 1:] = _rsi_series(smoothed_gains, smoothed_losses)
     return out
 
 
@@ -213,6 +263,16 @@ def _rsi_value(average_gain: float, average_loss: float) -> float:
     if average_loss == 0.0:
         return 100.0 if average_gain > 0.0 else 0.0
     return 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+
+
+# The same formula over whole arrays, with the flat-series rule applied where loss is zero.
+def _rsi_series(average_gain: np.ndarray, average_loss: np.ndarray) -> np.ndarray:
+    out = np.full(average_gain.size, 100.0)
+    flat = average_loss == 0.0
+    out[flat & (average_gain <= 0.0)] = 0.0
+    live = ~flat
+    out[live] = 100.0 - 100.0 / (1.0 + average_gain[live] / average_loss[live])
+    return out
 
 
 # Moving average convergence divergence; returns (macd, signal, histogram) as TA-Lib does.
@@ -336,15 +396,9 @@ def MFI(high, low, close, volume, timeperiod: int = 14) -> np.ndarray:
     positive = _sma(rising, timeperiod, 1) * timeperiod
     negative = _sma(falling, timeperiod, 1) * timeperiod
 
-    for i in range(timeperiod, closes.size):
-        up = positive[i]
-        down = negative[i]
-        if not np.isfinite(up) or not np.isfinite(down):
-            continue
-        if down == 0.0:
-            out[i] = 100.0 if up > 0.0 else 0.0
-        else:
-            out[i] = 100.0 - 100.0 / (1.0 + up / down)
+    # The same ratio as RSI, on flow instead of gains, once the smoothing has a value.
+    live = np.isfinite(positive) & np.isfinite(negative)
+    out[live] = _rsi_series(positive[live], negative[live])
     return out
 
 

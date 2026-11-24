@@ -74,11 +74,11 @@ class PortfolioManager:
         self._strategy_open_tickers: frozenset[str] = frozenset()
         self._strategy_open_trades: tuple[Trade, ...] = ()
         self._strategy_view_dirty: bool = True
-        self._trade_by_id: dict[int, Trade] = {}
         self.rejected_orders: dict[str, int] = {}
-        self._histories: dict[str, StockData] = {}
         # (ticker, date) -> history cut to that date, filled by the engine so an uncached fill reuses the bulk read.
         self._history_loader = None
+        # Today's volume per ticker, asked of the engine rather than kept as a second copy of the bars.
+        self._volume_lookup = None
         self._dividend_events: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_dividend_code: int | None = None
 
@@ -142,13 +142,17 @@ class PortfolioManager:
     def lots(self, ticker: str) -> list[Trade]:
         return self._open_trades_by_ticker.get(ticker, []).copy()
 
-    # Use already-loaded histories instead of re-reading bar files on fills.
-    def set_history_cache(self, histories: dict[str, StockData]) -> None:
-        self._histories = histories
+    # How many lots are open in one ticker, without copying the list.
+    def lot_count(self, ticker: str) -> int:
+        return len(self._open_trades_by_ticker.get(ticker, ()))
 
     # The backtester sets this once; fills use it before ever reading files.
     def set_history_loader(self, loader) -> None:
         self._history_loader = loader
+
+    # The backtester sets this once; the participation cap reads today's volume through it.
+    def set_volume_lookup(self, lookup) -> None:
+        self._volume_lookup = lookup
 
     # Cash distributions per ticker, as sorted (day codes, amount per share) pairs.
     def set_dividend_events(self, events: dict[str, tuple[np.ndarray, np.ndarray]]) -> None:
@@ -202,7 +206,7 @@ class PortfolioManager:
             open_price: float | None = self._get_valid_open_price(order.ticker, opens)
             if open_price is not None:
                 remainder: Order | None = self._fill_order(
-                    order, open_price, current_date, self._day_volume(order.ticker, current_date)
+                    order, open_price, current_date, self._day_volume(order.ticker)
                 )
                 if remainder is not None:
                     carried.append(remainder)
@@ -212,7 +216,7 @@ class PortfolioManager:
     # Fill every queued exit at today's open.
     def fill_pending_exits(self, current_date: str, opens: dict[str, float]) -> None:
         for trade_id in self.pending_exits:
-            trade: Trade | None = self._find_trade(trade_id)
+            trade: Trade | None = self.open_trades.get(trade_id)
             if trade is None or not trade.is_open:
                 continue
 
@@ -371,13 +375,11 @@ class PortfolioManager:
         allocation = fill_allocation
         entry_fee: float = round(equity_at_entry * allocation * self.FEE_RATE, 4)
 
-        history: StockData | None = self._histories.get(ticker)
+        if self._history_loader is None:
+            raise ValueError(f"No local data found for {ticker} in master database.")
+        history: StockData | None = self._history_loader(ticker, current_date)
         if history is None:
-            if self._history_loader is None:
-                raise ValueError(f"No local data found for {ticker} in master database.")
-            history = self._history_loader(ticker, current_date)
-            if history is None:
-                raise ValueError(f"No local data found for {ticker} in master database.")
+            raise ValueError(f"No local data found for {ticker} in master database.")
 
         # The trade gets its own cut of the bars through today. The engine's object is a shared
         # window that keeps moving, so a trade must never hold a reference to it.
@@ -408,7 +410,6 @@ class PortfolioManager:
         )
 
         self._next_trade_id += 1
-        self._trade_by_id[trade.id] = trade
         self.trades.append(trade)
         self.open_trades[trade.id] = trade
         self._open_trades_by_ticker.setdefault(ticker, []).append(trade)
@@ -485,19 +486,9 @@ class PortfolioManager:
             self._open_tickers.remove(trade.ticker)
         self._strategy_view_dirty = True
 
-    # Today's traded volume for the participation cap, or None when unknown.
-    def _day_volume(self, ticker: str, current_date: str) -> float | None:
-        history: StockData | None = self._histories.get(ticker)
-        if history is None:
-            return None
-        all_codes, _opens, _highs, _lows, _closes, all_volumes = history.full
-        if all_codes.size == 0:
-            return None
-        code: int = int(to_code(current_date))
-        index: int = int(np.searchsorted(all_codes, code, side="left"))
-        if index < all_codes.size and int(all_codes[index]) == code:
-            return float(all_volumes[index])
-        return None
+    # Today's traded volume for the participation cap, or None when the engine cannot say.
+    def _day_volume(self, ticker: str) -> float | None:
+        return None if self._volume_lookup is None else self._volume_lookup(ticker)
 
     # The opening price for a ticker, or None after recording a refusal.
     def _get_valid_open_price(self, ticker: str, opens: dict[str, float]) -> float | None:
@@ -558,10 +549,6 @@ class PortfolioManager:
             return wanted
 
         return min(wanted, self.cash / (equity_at_entry * (1.0 + self.FEE_RATE)))
-
-    # One open lot by id.
-    def _find_trade(self, trade_id: int) -> Trade | None:
-        return self._trade_by_id.get(trade_id)
 
     # Count a refusal, so a strategy can see why nothing happened.
     def _reject(self, reason: str) -> None:

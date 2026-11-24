@@ -1,6 +1,7 @@
 # -------- Dates.py --------
-# Compact date storage: one int32 day number per bar, one copy of each label.
-# A code is days since 1970-01-01, so it costs 4 bytes and sorts exactly like its label.
+# Compact date storage: one day number per bar, one copy of each label. Bars carry the code at
+# the width the bundle stores it (u2); code built on the fly is int32. A code is days since
+# 1970-01-01, so it sorts exactly like its label.
 #
 #   code  = to_code("2024-01-02")     -> 19724
 #   label = label(19724)              -> "2024-01-02"

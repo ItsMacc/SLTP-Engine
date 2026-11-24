@@ -6,6 +6,7 @@ import numpy as np
 import sltp.indicators as ta
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
@@ -117,11 +118,11 @@ class Strategy:
 
     # -------- Lifecycle Hooks --------
     # Build the starting universe; the default accepts the declared tickers.
-    def initialize_universe(self, current_date: str, histories: dict[str, StockData] | None = None) -> bool:
+    def initialize_universe(self, current_date: str, histories: Mapping[str, StockData] | None = None) -> bool:
         return bool(self.tickers)
 
     # Refresh self.tickers when REBALANCE_FREQUENCY comes due.
-    def on_rebalance(self, current_date: str, histories: dict[str, StockData] | None = None) -> None:
+    def on_rebalance(self, current_date: str, histories: Mapping[str, StockData] | None = None) -> None:
         return None
 
     # Evaluate one ticker's history and return an order, or None for no trade.
