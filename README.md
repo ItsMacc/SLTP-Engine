@@ -1,8 +1,41 @@
 # SLTP
 
-SLTP is a backtesting engine for daily stock bars, built on plain NumPy. You describe a strategy in a small Python class, and SLTP walks it through years of history one session at a time, fills the orders, tracks the portfolio, and reports back with an equity curve, a trade list, and a full set of performance statistics.
+A backtesting engine for daily stock bars. You write a strategy in one small Python class, SLTP walks it through twenty-eight years of history one session at a time, and you get an equity curve, a trade list and a full metric sheet back.
 
-A few things define how it works. Strategies only ever see data up to the current bar, so lookahead bias is structurally impossible rather than something you have to police yourself. Splits and dividends are applied to positions automatically. Orders support allocation sizing, stop-losses, and take-profits. The portfolio manager enforces your position limits and records why any order was rejected. And because the hot path is vectorized NumPy over a local flat-binary archive, a multi-decade run over thousands of tickers completes in seconds on an ordinary laptop.
+The whole archive is 59 million bars across 19,362 symbols, from 1998 to last week, sitting in 1.4 GB of flat binary files. A thirteen-year run that ranks 5,735 names every rebalance finishes in about two seconds on an M2 with the pages warm. That is the full ranking path, not one ticker held for show.
+
+At a glance:
+
+| | |
+|---|---|
+| bars on disk | 59,098,794 |
+| symbols | 19,362 across 14 markets |
+| history | 1998-01-01 to 2026-11-20 |
+| archive size | 1.42 GB, 16 files |
+| peak RSS, one-year run | 216 MiB |
+| dependencies | numpy, pyarrow, dateutil |
+
+Jump to: [Why it is fast](#why-it-is-fast) · [Quickstart](#quickstart) · [Writing a strategy](#writing-a-strategy) · [Running a backtest](#running-a-backtest) · [Market data](#market-data) · [CLI](#cli-commands)
+
+## Why it is fast
+
+Four decisions do most of the work, and none of them are micro-optimisation.
+
+**Indicators stream instead of recomputing.** A naive engine rebuilds a 200-day EMA from scratch on every bar, which is 200 multiplications to learn one new number. SLTP keeps one recurrence state per ticker per indicator and carries it forward, so `_ema`, `_rsi`, `_atr`, `_adx` and `_macd` cost O(1) per call instead of O(history). That single change made indicator-heavy runs roughly 25 to 35 times faster, with bit-identical values. The other fifteen indicators stay on the batch path, and `STREAMING_INDICATORS = False` turns the whole thing off if you ever want to compare.
+
+**One object per ticker, not one per ticker per day.** `StockData` holds a ticker's full loaded bars plus a window over them. The engine moves the window instead of allocating a new object, and each window's views are cached, so a strategy that reads only `closes` pays for one slice per day instead of six. A trade still gets its own frozen cut of the bars through its entry day, because its history must never shift under it.
+
+**The archive is a layout, not a pile of files to parse.** Each bundle carries a 24-byte preamble and a JSON header, then seven contiguous column blocks. Dates and symbol codes are `uint16`, rows are symbol-major and date-ascending, so one ticker's year is a byte range rather than a filter. A sidecar index per market is sorted by symbol and holds row counts, which turns "where is AAPL in 2011" into a binary search plus arithmetic. No pandas in the run path, no per-row Python, no copies.
+
+**The universe is lazy.** Declaring `histories` with no default is a promise that you need every ticker's bars, so the engine loads them. Writing `histories=None` is a promise that you do not, so it skips the full-market read entirely and hands you a membership set instead. The same rule applies to `on_rebalance`, and it is the difference between a one-second run and a thirty-second one on a fixed list.
+
+## What it will not let you do
+
+Lookahead bias is not policed, it is impossible. A strategy receives arrays that end at today's bar, the window moves forward under it, and the bar reader is not reachable from strategy code. You cannot accidentally call `get_stock_history` for next Tuesday because there is no such call to make.
+
+Reruns are byte-identical. Pin the dates and the same data version, and the numbers reproduce exactly, including the costs. Every run stamps the bar source it read (`own:<dir>` or `cache@<version>`), so a metric that moved is always explainable rather than mysterious.
+
+Rejected orders are not silent. The portfolio manager counts every refusal by reason, so `result["rejections"]` tells you that 412 orders died on "not enough equity to allocate", 31 on "maximum lots reached", and 6 on "hard to borrow", instead of that quiet feeling that something was ignored.
 
 ## Installation
 
@@ -12,9 +45,54 @@ Requires Python 3.11 or newer.
 pip install sltp
 ```
 
+## Quickstart
+
+Save this as `momentum.py`. It buys the four index ETFs whenever price sits above its twenty-day average, five positions maximum, rebalanced monthly.
+
+```python
+from sltp import Order, PositionType, RebalanceFrequency, Strategy
+
+
+class Momentum(Strategy):
+    def __init__(self) -> None:
+        super().__init__()
+        self.name = "Momentum 20"
+        self.MAX_POSITIONS = 5
+        self.MAX_ALLOCATION_PER_TICKER = 0.2
+        self.REBALANCE_FREQUENCY = RebalanceFrequency.MONTHLY
+        self.MIN_BARS_REQUIRED = 60
+
+    def initialize_universe(self, current_date: str, histories=None) -> bool:
+        self.tickers.clear()
+        for ticker in ("SPY", "QQQ", "IWM", "DIA", "TLT"):
+            if ticker in self.available_universe:
+                self.add_ticker(ticker)
+        return bool(self.tickers)
+
+    def on_signal(self, ticker: str, data) -> Order | None:
+        if ticker in self.open_tickers:
+            return None
+        closes = data.closes
+        if len(closes) < 60 or float(closes[-1]) <= self._sma(closes, 20)[-1]:
+            return None
+        return Order(
+            ticker=ticker,
+            position_type=PositionType.LONG,
+            allocation=0.2,
+            stop_loss=0.0,
+            take_profit=0.0,
+        )
+```
+
+```bash
+sltp backtest momentum.py --start 2014-01-01 --chart
+```
+
+That prints the hooks, the metrics, the trade list, and writes an SVG equity curve with a buy-and-hold SPY line for reference. The rest of this document goes through the pieces in the order you will actually touch them.
+
 ## Writing a strategy
 
-Everything lives in one class. Copy this skeleton into a file (say `my_strategy.py`), fill in the pieces, and you have a working strategy.
+Everything lives in one class. Copy the skeleton below, delete what you do not need, and you have a working strategy. Only `on_signal` is required.
 
 ```python
 from sltp import Order, PositionType, Strategy
@@ -41,11 +119,9 @@ class MyStrategy(Strategy):
         return False
 ```
 
-Only `on_signal` is required. The rest have sensible defaults, so delete whatever you don't need. The sections below go through each piece in the order you'll actually write it.
-
 ### Step 1: `__init__`, name it and set your limits
 
-The constructor is where you give the strategy an identity and decide how much rope the portfolio manager gives it. Always call `super().__init__()` first.
+The constructor gives the strategy an identity and decides how much rope the portfolio manager hands it. Always call `super().__init__()` first.
 
 ```python
 def __init__(self) -> None:
@@ -69,18 +145,18 @@ What each knob does:
 | `MAX_POSITIONS` | `10` | maximum distinct open positions (`None` for unlimited) |
 | `MAX_ALLOCATION_PER_TICKER` | `None` | cap on portfolio fraction in one ticker (`None` for no cap) |
 | `MAX_LOTS_PER_TICKER` | `1` | maximum concurrent lots in one ticker |
-| `REBALANCE_FREQUENCY` | `NEVER` | how often `on_rebalance` fires: `DAILY`, `WEEKLY`, `MONTHLY`, `QUARTERLY`, `YEARLY`, or `NEVER` (import from `sltp`) |
+| `REBALANCE_FREQUENCY` | `NEVER` | when `on_rebalance` fires: `DAILY`, `WEEKLY`, `MONTHLY`, `QUARTERLY`, `YEARLY`, or `NEVER` |
 | `MIN_BARS_REQUIRED` | `0` | bars of history needed before any trading starts |
 | `LIQUIDATE_ON_END` | `False` | close everything on the final session |
-| `LOOKBACK_BARS` | `None` | sessions of history loaded before the start date, for indicators and universe ranking (`None` keeps the five-year default; set it to trim the bulk read to what the strategy actually uses) |
+| `LOOKBACK_BARS` | `None` | sessions loaded before the start date, for indicators and ranking (`None` keeps the five-year default) |
 
-When an order breaks one of these limits, it isn't silently dropped. The rejection is counted by reason in the result's `rejections`, so you can see exactly what stopped you.
+When an order breaks one of these limits it is counted by reason in `result["rejections"]`, never dropped quietly.
 
-Two extra read-only values are handy inside your logic: `open_tickers` (which tickers currently hold positions), `open_positions` (the open trades themselves), `open_position_count`, and current `equity` (the portfolio index level, starting at 100).
+A few read-only values are handy inside your logic: `open_tickers`, `open_positions`, `open_position_count`, and `equity` (the portfolio index level, starting at 100).
 
 ### Step 2: `initialize_universe`, choose what you can trade
 
-As the backtest steps forward, the engine asks one question: what is tradable today? Whether it loads every ticker's bars before asking is decided by your signature (see the performance note below). The fixed list keeps it cheap; the ranking filter pays for the full market. Add tickers with `add_ticker` (or `add_tickers` for a list, `remove_ticker` to drop one). Return `True` once the universe is ready. Returning `False` tells the engine it isn't ready yet, and it keeps walking forward until you accept.
+As the backtest steps forward, the engine asks one question: what is tradable today? Add tickers with `add_ticker` (or `add_tickers` for a list, `remove_ticker` to drop one), and return `True` once the universe is ready. Returning `False` says not yet, and the engine keeps walking forward until you accept.
 
 ```python
 def initialize_universe(self, current_date: str, histories=None) -> bool:
@@ -91,14 +167,14 @@ def initialize_universe(self, current_date: str, histories=None) -> bool:
     return bool(self.tickers)
 ```
 
-You don't have to hardcode names. Four properties list everything with local data behind it:
+You do not have to hardcode names. Four properties list everything with local data behind it:
 
 - `available_universe`, every ticker on disk
 - `available_stocks`, individual companies only
 - `available_etfs`, funds only
 - `available_gold`, gold proxies only
 
-When the universe itself is the question — ranking the whole market each rebalance — declare `histories` with no default and the engine loads every ticker's bars before calling you. Say you want liquid large caps and nothing under five dollars:
+When the universe itself is the question, declare `histories` with no default and the engine loads every ticker's bars before calling you. Say you want liquid large caps and nothing under five dollars:
 
 ```python
 def initialize_universe(self, current_date: str, histories: dict) -> bool:
@@ -110,13 +186,13 @@ def initialize_universe(self, current_date: str, histories: dict) -> bool:
     return bool(self.tickers)
 ```
 
-Because `data` only reaches the current bar, a filter like this can never peek at the future. Pair it with `REBALANCE_FREQUENCY` and `on_rebalance` to rebuild the list on a schedule instead of every day.
+Because `data` only reaches the current bar, a filter like this can never peek at the future. Pair it with `REBALANCE_FREQUENCY` and `on_rebalance` to rebuild the list on a schedule instead of every session.
 
-One performance note: declaring `histories` without a default tells the engine to load every ticker's bars before calling you. If your universe is hardcoded (or your rebalance just rotates a fixed list), write `histories=None` instead and the full-universe load is skipped entirely. The same rule applies to `on_rebalance`.
+The one performance note that matters: declaring `histories` without a default orders the full-universe load. If your universe is hardcoded, or your rebalance just rotates a fixed list, write `histories=None` and the engine skips that read.
 
 ### Step 3: `on_signal`, the actual decision
 
-Once per ticker per bar, the engine calls `on_signal` with that ticker's point-in-time history. `data` carries parallel NumPy arrays where the last element is today: `opens`, `highs`, `lows`, `closes`, `volumes`, plus `dates` (`"YYYY-MM-DD"` strings). `len(data)` is the number of bars visible so far. Return an `Order` to open a position, or `None` to pass.
+Once per ticker per bar, the engine calls `on_signal` with that ticker's point-in-time history. `data` carries parallel NumPy arrays whose last element is today: `opens`, `highs`, `lows`, `closes`, `volumes`, plus `dates` as `"YYYY-MM-DD"` strings. `len(data)` is the number of bars visible so far. Return an `Order` to open a position, or `None` to pass.
 
 ```python
 def on_signal(self, ticker: str, data) -> Order | None:
@@ -136,22 +212,9 @@ def on_signal(self, ticker: str, data) -> Order | None:
     )
 ```
 
-A few helpers round out the class. `on_rebalance` rebuilds the universe whenever `REBALANCE_FREQUENCY` comes due. `run_daily` runs once per session before any ticker is polled, good for warmup math or daily bookkeeping. `should_exit` holds custom exit logic per open trade, and three helpers cover the common cases: `_time_stop_days(trade, days)`, `_trailing_stop(trade, pct)`, and `_atr_stop(trade, multiplier)`.
+A few helpers round out the class. `on_rebalance` rebuilds the universe whenever `REBALANCE_FREQUENCY` comes due. `run_daily` runs once per session before any ticker is polled, good for warmup math or bookkeeping. `should_exit` holds custom exit logic per open trade, and three helpers cover the common cases: `_time_stop_days(trade, days)`, `_trailing_stop(trade, pct)`, `_atr_stop(trade, multiplier)`.
 
-You also get a full indicator shelf that runs on the point-in-time bars: `_sma`, `_ema`, `_dema`, `_tema`, `_rsi`, `_macd`, `_bollinger_bands`, `_atr`, `_adx`, `_stochastic`, `_stochastic_rsi`, `_williams_r`, `_cci`, `_roc`, `_momentum`, `_obv`, `_mfi`, `_ad`, `_trix`, and `_parabolic_sar`. So the 20-day check above can just be `self._sma(closes, 20)[-1]`.
-
-The five busiest indicators (`_ema`, `_rsi`, `_atr`, `_adx`, `_macd`) stream instead of recomputing: the engine carries one small recurrence state per ticker forward bar by bar, so each call costs O(1) instead of O(history). On indicator-heavy universes that runs roughly 25-35x faster with bit-identical values; everything else stays on the batch path. Set `STREAMING_INDICATORS = False` on your strategy to force the old path for every indicator.
-
-### How history is stored
-
-One `StockData` object exists per ticker for the whole run, not one per ticker per day. It holds that ticker's full loaded bars plus a window over them, and the engine moves the window instead of building a new object:
-
-- `data.closes` (and `opens`, `highs`, `lows`, `volumes`, `dates`) return the window only, so the last element is always today and there is no lookahead. `len(data)` is the number of bars visible so far. Each window's views are cached, so a strategy that reads only `closes` pays for one slice per day rather than six.
-- `data` is only valid for the callback it was passed to. Holding onto it and reading it on a later day reads that day's window, not the one you saw, which is a silent lookahead bug.
-- `set_window(start, end)` and `data.window` are engine-facing. A strategy never calls them: the engine cuts each ticker to today before `on_signal` and before `should_exit`.
-- `data.full` returns `(codes, opens, highs, lows, closes, volumes)`, the complete arrays ignoring the window. The engine uses it to scan dates and to cut a trade's snapshot; strategies should read the windowed arrays instead.
-
-Inside a run there is one store: `_store` maps ticker to its single `StockData`, and the portfolio manager reads that same dict, so bars are loaded once and referenced everywhere. The universe cache holds `(start, end)` spans per rebalance date instead of objects, so an as-of snapshot costs two integers. A trade still gets its own cut of the bars through its entry day, because its history must never move under it the way the shared window does.
+You also get an indicator shelf that runs on the point-in-time bars: `_sma`, `_ema`, `_dema`, `_tema`, `_rsi`, `_macd`, `_bollinger_bands`, `_atr`, `_adx`, `_stochastic`, `_stochastic_rsi`, `_williams_r`, `_cci`, `_roc`, `_momentum`, `_obv`, `_mfi`, `_ad`, `_trix`, and `_parabolic_sar`. So the twenty-day check above is just `self._sma(closes, 20)[-1]`.
 
 ### Step 4: orders, how you ask for a position
 
@@ -197,7 +260,18 @@ Order(ticker="QQQ", position_type=PositionType.SHORT, allocation=0.5,
       stop_loss=0.0, take_profit=0.0)
 ```
 
-`stop_loss` and `take_profit` are absolute prices, checked against the daily bars. `0.0` on either means no level there. Anything extra you want to remember (a signal score, a regime tag) rides along in `meta_data`, a plain dict the engine ignores.
+`stop_loss` and `take_profit` are absolute prices, checked against the daily bars. `0.0` on either means no level there. Anything extra you want to remember, a signal score or a regime tag, rides along in `meta_data`, a plain dict the engine ignores.
+
+### How history is stored
+
+One `StockData` object exists per ticker for the whole run, not one per ticker per day. It holds that ticker's full loaded bars plus a window over them, and the engine moves the window instead of building a new object:
+
+- `data.closes` (and `opens`, `highs`, `lows`, `volumes`, `dates`) return the window only, so the last element is always today and there is no lookahead. `len(data)` is the number of bars visible so far. Each window's views are cached, so a strategy that reads only `closes` pays for one slice per day rather than six.
+- `data` is only valid for the callback it was passed to. Holding onto it and reading it on a later day reads that day's window, not the one you saw, which is a silent lookahead bug.
+- `set_window(start, end)` and `data.window` are engine-facing. A strategy never calls them: the engine cuts each ticker to today before `on_signal` and before `should_exit`.
+- `data.full` returns `(codes, opens, highs, lows, closes, volumes)`, the complete arrays ignoring the window. The engine uses it to scan dates and to cut a trade's snapshot; strategies should read the windowed arrays instead.
+
+Inside a run there is one store: `_store` maps ticker to its single `StockData`, and the portfolio manager reads that same dict, so bars are loaded once and referenced everywhere. The universe cache holds `(start, end)` spans per rebalance date instead of objects, so an as-of snapshot costs two integers. A trade still gets its own cut of the bars through its entry day, because its history must never move under it the way the shared window does.
 
 ## Running a backtest
 
@@ -217,11 +291,11 @@ print(result["metrics"])
 print(result["trades"][-1])
 ```
 
-`end_date` defaults to the latest session on disk. Pass `include_dividends=False` to skip cash distributions. Four optional knobs model friction: `spread_pct` (one-way spread paid on every fill), `max_participation` (largest share of a bar's volume one fill may take, the rest waits for the next open), `min_fill_notional` (smallest fill worth booking, in dollars; anything smaller waits whole for the next open instead of opening a dust lot — default `0.01`, `0.0` disables it), and `borrow_rate` plus `hard_to_borrow` (annual cost of holding shorts, and tickers that can't be shorted at all). All default to zero friction, so leave them out and the run behaves exactly as before.
+`end_date` defaults to the latest session on disk. Pass `include_dividends=False` to skip cash distributions. Four optional knobs model friction: `spread_pct` (one-way spread paid on every fill), `max_participation` (largest share of a bar's volume one fill may take, the rest waits for the next open), `min_fill_notional` (smallest fill worth booking, in dollars, default `0.01`, `0.0` disables it), and `borrow_rate` plus `hard_to_borrow` (annual cost of holding shorts, and tickers that cannot be shorted at all). All default to zero friction, so leave them out and the run behaves exactly as before.
 
 The result is a dict with `metrics`, the `equity` curve records, the full `trades` list, `rejections` (refused orders by reason), and a `stamp` recording the strategy, dates, and costs behind the run.
 
-Comparing strategies in Python is just two runs side by side:
+Comparing strategies in Python is two runs side by side:
 
 ```python
 from sltp import Backtester
@@ -321,13 +395,27 @@ sltp compare value.py momentum.py --out compare.svg
 sltp compare a.py b.py c.py --json > results.json
 ```
 
+## Benchmarks
+
+Measured on an idle M2 with the archive in page cache. Both numbers move with disk warmth and with whatever else the machine is doing, so treat them as a shape rather than a contract.
+
+| run | what it does | time |
+|---|---|---|
+| minimum volatility, 2013 to 2026 | ranks 5,735 names per rebalance, 330 trades | ~2 s |
+| statistical mean reversion, 2013 to 2026 | ranks 11,897 names, 492 trades | ~4 s |
+| one year, one ticker | end-to-end smoke test | 0.6 s, 216 MiB peak |
+
+For scale, that works out to roughly 2.5 million bars a second through the full engine path: read, window, signal, fill, account. The streaming indicator work is what makes the ranked universes affordable, and the lazy universe load is what keeps the fixed-list runs cheap.
+
+Two checks keep it honest. `python test/smoke_backtest.py` runs the whole engine against the real archive end to end. `test/test_streaming_indicators.py` compares every streaming indicator against the batch implementation it replaced, so "same values, less work" is a test rather than a claim.
+
 ## Notes
 
-First run may take some time, but all subsequent runs will be significantly faster.
-
-Market data lives outside the package. If your bars are not in the default location, point at them once with `sltp data use <dir>` (or set `SLTP_DATA_DIR` for a single run).
+Bars live outside the package. If yours are not in the default location, point at them once with `sltp data use <dir>`, or set `SLTP_DATA_DIR` for a single run.
 
 A strategy file is ordinary Python. Its folder goes on `sys.path`, so it can import the files sitting next to it.
+
+The first run may take a while if it has to download bars. Everything after that reads local files.
 
 ## Links
 
